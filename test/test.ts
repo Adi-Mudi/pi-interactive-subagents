@@ -30,6 +30,7 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  getMuxBackend,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -55,6 +56,21 @@ import {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import * as herdrModule from "../pi-extension/subagents/herdr.ts";
+import {
+  HERDR_MIN_VERSION,
+  herdrEnvDetected,
+  parseHerdrVersion,
+  compareHerdrVersions,
+  parseHerdrError,
+  parseHerdrJson,
+  extractHerdrPaneId,
+  extractHerdrRootPaneId,
+  isHerdrAvailable,
+  isHerdrErrorCode,
+  closeHerdrSurface,
+  HerdrError,
+} from "../pi-extension/subagents/herdr.ts";
 
 // --- Helpers ---
 
@@ -2373,6 +2389,323 @@ describe("cmux.ts", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+});
+
+describe("herdr.ts", () => {
+  const testApi = (herdrModule as any).__herdrTest__;
+
+  describe("version floor", () => {
+    it("exports the single 0.9.0 floor constant", () => {
+      assert.equal(HERDR_MIN_VERSION, "0.9.0");
+    });
+
+    it("parses `herdr 0.9.3` and bare versions", () => {
+      assert.deepEqual(parseHerdrVersion("herdr 0.9.3"), [0, 9, 3]);
+      assert.deepEqual(parseHerdrVersion("0.10.0"), [0, 10, 0]);
+      assert.equal(parseHerdrVersion("not a version"), null);
+      assert.equal(parseHerdrVersion(undefined), null);
+    });
+
+    it("compares versions numerically, not lexically", () => {
+      assert.ok(compareHerdrVersions("0.9.3", "0.9.0") > 0);
+      assert.ok(compareHerdrVersions("0.8.2", "0.9.0") < 0);
+      assert.ok(compareHerdrVersions("0.9.0", "0.9.0") === 0);
+      // The classic lexical trap: "0.10.0" must beat "0.9.3".
+      assert.ok(compareHerdrVersions("0.10.0", "0.9.3") > 0);
+    });
+  });
+
+  describe("detection", () => {
+    it("accepts HERDR_ENV=1 or HERDR_PANE_ID and nothing else", () => {
+      assert.equal(herdrEnvDetected({ HERDR_ENV: "1" } as any), true);
+      assert.equal(herdrEnvDetected({ HERDR_PANE_ID: "w1:p2" } as any), true);
+      assert.equal(herdrEnvDetected({ HERDR_ENV: "0", HERDR_PANE_ID: "" } as any), false);
+      assert.equal(herdrEnvDetected({} as any), false);
+      assert.equal(herdrEnvDetected({ TMUX: "/tmp/tmux" } as any), false);
+    });
+
+    it("isHerdrAvailable() is a boolean", () => {
+      assert.equal(typeof isHerdrAvailable(), "boolean");
+    });
+
+    it("resolves the herdr backend via PI_SUBAGENT_MUX when herdr is installed", (t) => {
+      const prevPref = process.env.PI_SUBAGENT_MUX;
+      const prevEnv = process.env.HERDR_ENV;
+      process.env.PI_SUBAGENT_MUX = "herdr";
+      process.env.HERDR_ENV = "1";
+      try {
+        if (!isHerdrAvailable()) {
+          t.skip("herdr CLI not installed");
+          return;
+        }
+        assert.equal(getMuxBackend(), "herdr");
+      } finally {
+        if (prevPref === undefined) delete process.env.PI_SUBAGENT_MUX;
+        else process.env.PI_SUBAGENT_MUX = prevPref;
+        if (prevEnv === undefined) delete process.env.HERDR_ENV;
+        else process.env.HERDR_ENV = prevEnv;
+      }
+    });
+  });
+
+  describe("response and error parsing", () => {
+    // Real `herdr pane split w1:p1 --direction right --no-focus` payload (0.9.3).
+    const SPLIT_OUTPUT = JSON.stringify({
+      id: "cli:pane:split",
+      result: {
+        pane: { pane_id: "w1:p2", tab_id: "w1:t1", workspace_id: "w1", focused: false },
+        type: "pane_info",
+      },
+    });
+
+    // Real `herdr workspace create --no-focus` payload (0.9.3).
+    const ROOT_OUTPUT = JSON.stringify({
+      id: "cli:workspace:create",
+      result: { root_pane: { pane_id: "w1:p1" }, tab: { tab_id: "w1:t1" } },
+    });
+
+    // Real failure: stderr JSON, non-zero exit (0.9.3).
+    const NOT_FOUND_STDERR = JSON.stringify({
+      error: { code: "pane_not_found", message: "pane wZ:p99 not found" },
+      id: "cli:pane:get",
+    });
+
+    it("extracts pane ids from split payloads", () => {
+      assert.equal(extractHerdrPaneId(SPLIT_OUTPUT, "pane split"), "w1:p2");
+    });
+
+    it("extracts root pane ids from tab/workspace payloads", () => {
+      assert.equal(extractHerdrRootPaneId(ROOT_OUTPUT, "tab create"), "w1:p1");
+    });
+
+    it("throws a contextual error on malformed payloads", () => {
+      assert.throws(() => extractHerdrPaneId("not json", "pane split"), /Unexpected herdr pane split output/);
+      assert.throws(
+        () => extractHerdrRootPaneId(JSON.stringify({ result: {} }), "tab create"),
+        /Unexpected herdr tab create output/,
+      );
+    });
+
+    it("parses the herdr stderr error envelope", () => {
+      assert.deepEqual(parseHerdrError(NOT_FOUND_STDERR), {
+        code: "pane_not_found",
+        message: "pane wZ:p99 not found",
+      });
+      assert.equal(parseHerdrError("plain text, no json"), null);
+      assert.equal(parseHerdrError(undefined), null);
+      assert.equal(parseHerdrError(JSON.stringify({ error: {} })), null);
+    });
+
+    it("parses JSON safely", () => {
+      assert.equal(parseHerdrJson("nope"), null);
+      assert.deepEqual(parseHerdrJson('{"ok":true}'), { ok: true });
+    });
+
+    it("recognises herdr error codes and carries them on HerdrError", () => {
+      const error = new HerdrError("pane_not_found", "pane w1:p2 not found", ["pane", "close", "w1:p2"]);
+      assert.equal(isHerdrErrorCode(error, "pane_not_found"), true);
+      assert.equal(isHerdrErrorCode(error, "agent_not_found"), false);
+      assert.match(error.message, /pane close w1:p2 failed \(pane_not_found\)/);
+    });
+
+    it("adds an actionable hint for a missing server", () => {
+      const error = new HerdrError("server_not_running", "no herdr server", ["pane", "list"]);
+      assert.match(error.message, /HERDR_SOCKET_PATH/);
+      assert.equal(testApi.herdrErrorHint("pane_not_found"), null);
+    });
+  });
+
+  describe("argv builders", () => {
+    it("builds a no-focus split and maps unsupported directions", () => {
+      assert.deepEqual(testApi.herdrSplitDirection("left"), "right");
+      assert.deepEqual(testApi.herdrSplitDirection("up"), "down");
+      assert.deepEqual(testApi.buildHerdrSplitArgs("w1:p1", "right", { cwd: "/tmp/x" }), [
+        "pane",
+        "split",
+        "w1:p1",
+        "--direction",
+        "right",
+        "--no-focus",
+        "--cwd",
+        "/tmp/x",
+      ]);
+      assert.deepEqual(testApi.buildHerdrSplitArgs(undefined, "down"), [
+        "pane",
+        "split",
+        "--direction",
+        "down",
+        "--no-focus",
+      ]);
+    });
+
+    it("builds the tab-create fallback without focus", () => {
+      assert.deepEqual(testApi.buildHerdrTabCreateArgs("Scout", { cwd: "/tmp/y" }), [
+        "tab",
+        "create",
+        "--label",
+        "Scout",
+        "--no-focus",
+        "--cwd",
+        "/tmp/y",
+      ]);
+    });
+
+    it("delivers commands atomically through pane run", () => {
+      assert.deepEqual(testApi.buildHerdrPaneRunArgs("w1:p2", "bash /tmp/s.sh"), [
+        "pane",
+        "run",
+        "w1:p2",
+        "bash /tmp/s.sh",
+      ]);
+    });
+
+    it("reads with the unwrapped source by default", () => {
+      assert.deepEqual(testApi.buildHerdrPaneReadArgs("w1:p2", 40), [
+        "pane",
+        "read",
+        "w1:p2",
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "40",
+        "--format",
+        "text",
+      ]);
+      assert.deepEqual(testApi.buildHerdrAgentReadArgs("w1:p2", 40, "recent"), [
+        "agent",
+        "read",
+        "w1:p2",
+        "--source",
+        "recent",
+        "--lines",
+        "40",
+        "--format",
+        "text",
+      ]);
+    });
+
+    it("sends Escape through the agent facade or the pane fallback", () => {
+      assert.deepEqual(testApi.buildHerdrEscapeArgs("w1:p2", true), [
+        "agent",
+        "send-keys",
+        "w1:p2",
+        "esc",
+      ]);
+      assert.deepEqual(testApi.buildHerdrEscapeArgs("w1:p2", false), [
+        "pane",
+        "send-keys",
+        "w1:p2",
+        "esc",
+      ]);
+    });
+
+    it("builds the agent facade commands from the decision doc §3.4", () => {
+      assert.deepEqual(testApi.buildHerdrAgentStartArgs("Scout", "w1:p2"), [
+        "agent",
+        "start",
+        "Scout",
+        "--kind",
+        "pi",
+        "--pane",
+        "w1:p2",
+        "--timeout",
+        "30000",
+      ]);
+      assert.deepEqual(
+        testApi.buildHerdrAgentPromptArgs("Scout", "do the thing", {
+          until: ["done", "idle"],
+          timeoutMs: 5000,
+        }),
+        [
+          "agent",
+          "prompt",
+          "Scout",
+          "do the thing",
+          "--wait",
+          "--until",
+          "done",
+          "--until",
+          "idle",
+          "--timeout",
+          "5000",
+        ],
+      );
+      assert.deepEqual(testApi.buildHerdrAgentWaitArgs("Scout", { timeoutMs: 1000 }), [
+        "agent",
+        "wait",
+        "Scout",
+        "--until",
+        "done",
+        "--until",
+        "idle",
+        "--timeout",
+        "1000",
+      ]);
+    });
+
+    it("builds cosmetic renames", () => {
+      assert.deepEqual(testApi.buildHerdrPaneRenameArgs("w1:p2", "Scout"), [
+        "pane",
+        "rename",
+        "w1:p2",
+        "Scout",
+      ]);
+      assert.deepEqual(testApi.buildHerdrTabRenameArgs("w1:t1", "Scout"), [
+        "tab",
+        "rename",
+        "w1:t1",
+        "Scout",
+      ]);
+      assert.deepEqual(testApi.buildHerdrWorkspaceRenameArgs("w1", "Scout"), [
+        "workspace",
+        "rename",
+        "w1",
+        "Scout",
+      ]);
+    });
+  });
+
+  describe("safety invariants", () => {
+    it("refuses to close the herdr parent pane", () => {
+      const prev = process.env.HERDR_PANE_ID;
+      process.env.HERDR_PANE_ID = "w1:p1";
+      try {
+        assert.throws(() => closeHerdrSurface("w1:p1"), /Refusing to close the herdr parent pane/);
+      } finally {
+        if (prev === undefined) delete process.env.HERDR_PANE_ID;
+        else process.env.HERDR_PANE_ID = prev;
+      }
+    });
+
+    it("never builds a destructive server/tab/workspace command", () => {
+      const builderOutputs = [
+        testApi.buildHerdrSplitArgs("w1:p1", "right", { cwd: "/tmp" }),
+        testApi.buildHerdrTabCreateArgs("Scout", { cwd: "/tmp" }),
+        testApi.buildHerdrPaneRunArgs("w1:p2", "bash /tmp/s.sh"),
+        testApi.buildHerdrPaneReadArgs("w1:p2", 10),
+        testApi.buildHerdrAgentReadArgs("w1:p2", 10),
+        testApi.buildHerdrEscapeArgs("w1:p2", true),
+        testApi.buildHerdrEscapeArgs("w1:p2", false),
+        testApi.buildHerdrPaneRenameArgs("w1:p2", "Scout"),
+        testApi.buildHerdrTabRenameArgs("w1:t1", "Scout"),
+        testApi.buildHerdrWorkspaceRenameArgs("w1", "Scout"),
+        testApi.buildHerdrAgentStartArgs("Scout", "w1:p2"),
+        testApi.buildHerdrAgentPromptArgs("Scout", "hi"),
+        testApi.buildHerdrAgentWaitArgs("Scout"),
+      ];
+
+      for (const args of builderOutputs) {
+        assert.equal(args.includes("stop"), false, `unexpected stop in: ${args.join(" ")}`);
+        assert.equal(args.includes("close"), false, `unexpected close in: ${args.join(" ")}`);
+        assert.equal(args.includes("kill"), false, `unexpected kill in: ${args.join(" ")}`);
+      }
+    });
+
+    it("exposes no server-stop helper", () => {
+      assert.equal(typeof (herdrModule as any).stopHerdrServer, "undefined");
+      assert.equal(typeof (herdrModule as any).stopHerdr, "undefined");
     });
   });
 });

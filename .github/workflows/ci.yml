@@ -1,0 +1,258 @@
+# CI for pi-interactive-subagents (fork).
+#
+# Three jobs:
+#   unit            — the repo's unit suite (`npm test`) on Linux + macOS.
+#   herdr-contract  — the herdr backend driven against a PINNED herdr release
+#                     inside a REAL herdr pane, on Linux + macOS. This is the
+#                     gate: it fails if the herdr CLI surface the backend uses
+#                     changes under the pin.
+#   herdr-canary    — the same run against the LATEST herdr, non-blocking. herdr
+#                     is pre-1.0, so the canary informs us instead of blocking
+#                     unrelated work; a red canary is a signal to re-check the
+#                     backend, not a broken build.
+#
+# Node 24 is required: this repo ships TypeScript run directly by Node (no build
+# step), and Node 24 strips types without a flag.
+#
+# Windows is deliberately out of the matrix: herdr's Windows support is
+# preview-only.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Version the contract job pins. Keep at/above the backend's floor.
+  HERDR_PINNED_VERSION: "0.9.3"
+  NODE_VERSION: "24"
+
+jobs:
+  unit:
+    name: Unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Unit tests
+        env:
+          # Keep the run deterministic: a developer's global agents directory must
+          # never shadow the bundled agent definitions the suite asserts on.
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/agent-cfg
+        run: npm test
+      - name: herdr version floor matches the CI pin
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          FLOOR="$(grep -oE 'HERDR_MIN_VERSION = "[0-9]+\.[0-9]+\.[0-9]+"' pi-extension/subagents/herdr.ts | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+          echo "code floor: ${FLOOR} / pinned: ${HERDR_PINNED_VERSION}"
+          if [ -z "${FLOOR}" ]; then
+            echo "::error::could not read HERDR_MIN_VERSION from pi-extension/subagents/herdr.ts"
+            exit 1
+          fi
+          LOWEST="$(printf '%s\n%s\n' "${FLOOR}" "${HERDR_PINNED_VERSION}" | sort -V | head -1)"
+          if [ "${LOWEST}" != "${FLOOR}" ]; then
+            echo "::error::the contract job pins herdr ${HERDR_PINNED_VERSION}, below the code floor ${FLOOR}"
+            exit 1
+          fi
+
+  herdr-contract:
+    # NOTE: job-level `name` may only use the github/needs/strategy/matrix/vars/
+    # inputs contexts — adding `env.HERDR_PINNED_VERSION` here makes the whole
+    # workflow invalid (GitHub then reports a failed run with zero jobs).
+    name: herdr contract (pinned, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Install herdr ${{ env.HERDR_PINNED_VERSION }} (pinned)
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64)   ASSET=herdr-linux-x86_64 ;;
+            Linux-ARM64) ASSET=herdr-linux-aarch64 ;;
+            macOS-X64)   ASSET=herdr-macos-x86_64 ;;
+            macOS-ARM64) ASSET=herdr-macos-aarch64 ;;
+            *) echo "::error::unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+          esac
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL --retry 3 -o "$HOME/.local/bin/herdr" \
+            "https://github.com/herdrdev/herdr/releases/download/v${HERDR_PINNED_VERSION}/${ASSET}"
+          chmod +x "$HOME/.local/bin/herdr"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Verify the pinned version
+        run: |
+          set -euo pipefail
+          INSTALLED="$(herdr --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+          echo "installed herdr: ${INSTALLED}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "${INSTALLED}" != "${HERDR_PINNED_VERSION}" ]; then
+            echo "::error::expected herdr ${HERDR_PINNED_VERSION}, got ${INSTALLED}"
+            exit 1
+          fi
+      - name: herdr contract tests inside a real herdr pane
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/herdr-contract
+          export HERDR_SOCKET_PATH="$RUNNER_TEMP/herdr-contract.sock"
+          nohup herdr server > .tmp/herdr-contract/server.log 2>&1 &
+          # The socket can exist before the server is serving, and the not-yet-up
+          # status contains the word "running" — exclude the negative string
+          # before accepting the positive one.
+          READY=0
+          for _ in $(seq 1 60); do
+            STATUS="$(herdr status server 2>&1 || true)"
+            printf '%s\n' "$STATUS"
+            if ! printf '%s' "$STATUS" | grep -qi 'not running' \
+              && printf '%s' "$STATUS" | grep -qiE 'running|ready|up|ok'; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::herdr server did not report ready within 60s"
+            cat .tmp/herdr-contract/server.log || true
+            exit 1
+          fi
+          herdr status server > .tmp/herdr-contract/status.txt 2>&1 || true
+          # A real workspace + root pane (no focus steal), cwd = repo root.
+          herdr workspace create --cwd "$PWD" --label p4-contract --no-focus > .tmp/herdr-contract/workspace.json
+          PANE="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(".tmp/herdr-contract/workspace.json","utf8")).result.root_pane.pane_id)')"
+          echo "herdr pane: $PANE"
+          sleep 3   # let the pane's shell reach its prompt before typing
+          # Run the mux-level suites INSIDE the pane so herdr injects
+          # HERDR_ENV/HERDR_PANE_ID (the backend's detection contract).
+          herdr pane run "$PANE" "cd '$PWD' && PI_SUBAGENT_MUX=herdr node --test --test-concurrency=1 test/integration/herdr-surface.test.ts test/integration/mux-surface.test.ts; echo HERDR_CONTRACT_EXIT=\$?"
+          FOUND=0
+          for _ in $(seq 1 150); do
+            OUT="$(herdr pane read "$PANE" --source recent --lines 600 --format text 2>/dev/null || true)"
+            if printf '%s' "$OUT" | grep -qE 'HERDR_CONTRACT_EXIT=[0-9]+'; then FOUND=1; break; fi
+            sleep 2
+          done
+          printf '%s\n' "${OUT:-}" > .tmp/herdr-contract/pane-output.txt
+          if [ "$FOUND" -ne 1 ]; then
+            echo "::error::in-pane contract run did not finish within 300s"
+            tail -60 .tmp/herdr-contract/pane-output.txt
+            exit 1
+          fi
+          tail -40 .tmp/herdr-contract/pane-output.txt
+          CODE="$(printf '%s' "$OUT" | grep -oE 'HERDR_CONTRACT_EXIT=[0-9]+' | tail -1 | cut -d= -f2)"
+          if [ "${CODE}" != "0" ]; then
+            echo "::error::in-pane contract tests failed (exit ${CODE})"
+            exit 1
+          fi
+      - name: Stop herdr server
+        if: always()
+        run: herdr server stop || true
+      - name: Upload herdr contract logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: herdr-contract-${{ matrix.os }}
+          path: .tmp/herdr-contract/
+          if-no-files-found: ignore
+
+  herdr-canary:
+    name: herdr canary (latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # herdr is pre-1.0: the canary reports, it never blocks.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Install the latest herdr (canary)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://herdr.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Record the canary version
+        run: |
+          set -euo pipefail
+          herdr --version | tee -a "$GITHUB_STEP_SUMMARY"
+      # Intentionally mirrors the contract job's in-pane recipe; the two jobs
+      # differ only in how herdr is installed (pin vs latest).
+      - name: herdr contract tests inside a real herdr pane (latest)
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/herdr-canary
+          export HERDR_SOCKET_PATH="$RUNNER_TEMP/herdr-canary.sock"
+          nohup herdr server > .tmp/herdr-canary/server.log 2>&1 &
+          READY=0
+          for _ in $(seq 1 60); do
+            STATUS="$(herdr status server 2>&1 || true)"
+            printf '%s\n' "$STATUS"
+            if ! printf '%s' "$STATUS" | grep -qi 'not running' \
+              && printf '%s' "$STATUS" | grep -qiE 'running|ready|up|ok'; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::herdr server did not report ready within 60s"
+            cat .tmp/herdr-canary/server.log || true
+            exit 1
+          fi
+          herdr workspace create --cwd "$PWD" --label p4-canary --no-focus > .tmp/herdr-canary/workspace.json
+          PANE="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(".tmp/herdr-canary/workspace.json","utf8")).result.root_pane.pane_id)')"
+          sleep 3
+          herdr pane run "$PANE" "cd '$PWD' && PI_SUBAGENT_MUX=herdr node --test --test-concurrency=1 test/integration/herdr-surface.test.ts test/integration/mux-surface.test.ts; echo HERDR_CANARY_EXIT=\$?"
+          FOUND=0
+          for _ in $(seq 1 150); do
+            OUT="$(herdr pane read "$PANE" --source recent --lines 600 --format text 2>/dev/null || true)"
+            if printf '%s' "$OUT" | grep -qE 'HERDR_CANARY_EXIT=[0-9]+'; then FOUND=1; break; fi
+            sleep 2
+          done
+          printf '%s\n' "${OUT:-}" > .tmp/herdr-canary/pane-output.txt
+          if [ "$FOUND" -ne 1 ]; then
+            echo "::error::canary run did not finish within 300s"
+            tail -60 .tmp/herdr-canary/pane-output.txt
+            exit 1
+          fi
+          tail -40 .tmp/herdr-canary/pane-output.txt
+          CODE="$(printf '%s' "$OUT" | grep -oE 'HERDR_CANARY_EXIT=[0-9]+' | tail -1 | cut -d= -f2)"
+          if [ "${CODE}" != "0" ]; then
+            echo "::warning::canary failed against the latest herdr (exit ${CODE}) — non-blocking"
+            exit 1
+          fi
+      - name: Stop herdr server
+        if: always()
+        run: herdr server stop || true
+      - name: Upload herdr canary logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: herdr-canary
+          path: .tmp/herdr-canary/
+          if-no-files-found: ignore
