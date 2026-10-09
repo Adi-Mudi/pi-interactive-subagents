@@ -74,7 +74,10 @@ jobs:
           fi
 
   herdr-contract:
-    name: herdr contract (pinned ${{ env.HERDR_PINNED_VERSION }}, ${{ matrix.os }})
+    # NOTE: job-level `name` may only use the github/needs/strategy/matrix/vars/
+    # inputs contexts — adding `env.HERDR_PINNED_VERSION` here makes the whole
+    # workflow invalid (GitHub then reports a failed run with zero jobs).
+    name: herdr contract (pinned, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
