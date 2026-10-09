@@ -3,3 +3,4 @@ config.json
 .pi/*
 !.pi/skills/
 !.pi/settings.json
+.IDE_Plans/

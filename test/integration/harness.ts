@@ -89,7 +89,7 @@ export function getAvailableBackends(): MuxBackend[] {
   const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
 
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
+  for (const backend of ["cmux", "tmux", "zellij", "herdr"] as MuxBackend[]) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -126,6 +126,15 @@ export function focusSurface(backend: MuxBackend, surface: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // herdr has no absolute pane focusing via the CLI (same limitation as
+    // wezterm). Focus is preserved by spawning panes with `--no-focus`, which
+    // the backend asserts instead — see test/integration/herdr-surface.test.ts.
+    throw new Error(
+      "Focus helpers are not implemented for herdr (no absolute pane focusing via the CLI)",
+    );
+  }
+
   throw new Error(`Focus helpers are not implemented for ${backend}`);
 }
 
@@ -147,6 +156,12 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
     }
   }
 
+  if (backend === "herdr") {
+    throw new Error(
+      "Focus helpers are not implemented for herdr (no absolute pane focusing via the CLI)",
+    );
+  }
+
   throw new Error(`Focus helpers are not implemented for ${backend}`);
 }
 
@@ -157,6 +172,11 @@ export function getSurfacePane(backend: MuxBackend, surface: string): string | n
   }
 
   if (backend === "tmux") return surface;
+
+  if (backend === "herdr") {
+    // A herdr pane id is the surface itself.
+    return surface;
+  }
 
   throw new Error(`Pane lookup is not implemented for ${backend}`);
 }

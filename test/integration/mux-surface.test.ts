@@ -63,7 +63,16 @@ for (const backend of backends) {
       restoreBackend(prevMux);
     });
 
-    it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
+    it("keeps focus on the active surface while creating and targeting subagent surfaces", async (t) => {
+      if (backend === "herdr") {
+        // herdr exposes no absolute pane focusing via the CLI, so "is the anchor
+        // still focused" cannot be asserted here. The herdr backend's own suite
+        // asserts the equivalent guarantee directly: `pane split --no-focus`
+        // leaves the parent focused (test/integration/herdr-surface.test.ts).
+        t.skip("herdr has no CLI pane-focus control");
+        return;
+      }
+
       const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
       await sleep(1000);
 
