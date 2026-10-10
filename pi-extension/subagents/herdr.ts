@@ -44,8 +44,22 @@
  * 3. Never swallow a genuine failure: unknown herdr error codes propagate as
  *    `HerdrError`. Only documented, idempotent cases are tolerated
  *    (`pane_not_found` on close) and safe fallbacks are bounded to one try.
+ * 4. Never create a herdr tab (v3.8.3, same-tab-only): this module emits no
+ *    `tab create` argv at all. A full tab degrades INSIDE the tab (overflow
+ *    reclaim of a finished pane) and finally fails loudly (F5a/F6).
+ * 5. Never split a pane we do not own: the placement path requires
+ *    `HERDR_PANE_ID` (`requireHerdrParentPaneId`) and `buildHerdrSplitArgs`
+ *    makes the pane argument mandatory, because a pane-less `pane split` makes
+ *    herdr target the caller's *current* - possibly foreign - pane. Measured
+ *    live: see .IDE_Plans/probe-v383/phase0-evidence.md §E-5.
+ * 6. Placement is serialised across processes with a lock file next to the
+ *    herdr socket (`withHerdrPlacementLock`, F4a): two pi sessions spawning
+ *    into the same tab cannot interleave their split + resize passes.
  */
 import { execFile, execFileSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -109,12 +123,18 @@ export function herdrSplitDirection(direction: HerdrSplitDirection): "right" | "
 
 /** Below this many rows a fresh stacked pane is unreadable -> new column. */
 export const HERDR_DEFAULT_MIN_PANE_HEIGHT = 8;
-/** Below this many columns a fresh column is unusable -> new tab fallback. */
+/** Below this many columns a fresh column is unusable -> overflow reclaim. */
 export const HERDR_DEFAULT_MIN_COLUMN_WIDTH = 24;
 /** Share of the tab width the calling pi pane keeps. */
 export const HERDR_PARENT_WIDTH_SHARE = 0.5;
 /** Resize passes per spawn; a second pass only fixes +/-1 rounding drift. */
 export const HERDR_LAYOUT_MAX_PASSES = 2;
+/** Placement lock (F4a): how long to wait for the cross-process lock. */
+export const HERDR_PLACEMENT_LOCK_DEFAULT_TIMEOUT_MS = 5_000;
+/** Placement lock (F4a): a lock older than this belonged to a dead process. */
+export const HERDR_PLACEMENT_LOCK_DEFAULT_STALE_MS = 30_000;
+/** EC-3 accounting: hard cap on the managed-pane registry (oldest evicted). */
+export const HERDR_MANAGED_PANE_LIMIT = 256;
 
 /** Ignore resize deltas below this many rows/columns (rounding noise). */
 const HERDR_MIN_RESIZE_EXTENT = 1;
@@ -162,8 +182,12 @@ export interface HerdrResizeStep {
   amount: number;
 }
 
-/** `stack` splits a column pane down; `new-column` splits the parent right. */
-export type HerdrScoutPlacementMode = "stack" | "new-column" | "new-tab";
+/**
+ * `stack` splits a column pane down; `new-column` splits the parent right;
+ * `overflow` means the target column is full and no new column fits, so the
+ * caller reclaims a finished pane (`reclaimPane`) and re-plans. Never a tab.
+ */
+export type HerdrScoutPlacementMode = "stack" | "new-column" | "overflow";
 
 export interface HerdrScoutPlacement {
   mode: HerdrScoutPlacementMode;
@@ -173,12 +197,16 @@ export interface HerdrScoutPlacement {
   /** Resize steps known before the split; the executor recomputes after it. */
   resizes: HerdrResizeStep[];
   reason: string;
+  /** `overflow` only: the finished pane to close before re-planning (F1a). */
+  reclaimPane?: string | null;
 }
 
 export interface HerdrPlacementOptions {
   parentPaneId: string;
   minPaneHeight?: number;
   minColumnWidth?: number;
+  /** Panes whose subagent already finished (oldest first) — overflow reclaim. */
+  finishedPaneIds?: string[];
 }
 
 /** `column` only equalises the right-most column; `layout` also pins widths. */
@@ -487,19 +515,32 @@ export function getHerdrPaneLayout(pane: string): HerdrLayoutSnapshot | null {
 
 // ── Argv builders (pure — the unit-testable contract) ───────────────────────
 
-/** `pane split [<pane>] --direction right|down [--ratio <f>] --no-focus [--cwd <p>]` */
+/**
+ * `pane split <pane> --direction right|down [--ratio <f>] --no-focus [--cwd <p>]`
+ *
+ * The pane argument is MANDATORY (F9): omitting it makes herdr split the
+ * caller's current pane, which may be a pane this plugin does not own.
+ */
 export function buildHerdrSplitArgs(
-  pane: string | undefined,
+  pane: string,
   direction: HerdrSplitDirection,
   options?: { cwd?: string; ratio?: number },
 ): string[] {
-  const args = ["pane", "split"];
-  if (pane) args.push(pane);
-  args.push("--direction", herdrSplitDirection(direction));
-  if (typeof options?.ratio === "number") args.push("--ratio", String(options.ratio));
-  args.push("--no-focus");
-  if (options?.cwd) args.push("--cwd", options.cwd);
-  return args;
+  if (!pane) {
+    throw new Error(
+      "Refusing to build a pane-less `pane split`: herdr would split the caller's current pane (same-tab-only guard, F9).",
+    );
+  }
+  return [
+    "pane",
+    "split",
+    pane,
+    "--direction",
+    herdrSplitDirection(direction),
+    ...(typeof options?.ratio === "number" ? ["--ratio", String(options.ratio)] : []),
+    "--no-focus",
+    ...(options?.cwd ? ["--cwd", options.cwd] : []),
+  ];
 }
 
 /** `pane layout --pane <pane>` — geometry snapshot (rects + split ratios). */
@@ -514,13 +555,6 @@ export function buildHerdrResizeArgs(
   amount: number,
 ): string[] {
   return ["pane", "resize", "--pane", pane, "--direction", direction, "--amount", String(amount)];
-}
-
-/** `tab create --label <name> --no-focus [--cwd <path>]` — split fallback. */
-export function buildHerdrTabCreateArgs(label: string, options?: { cwd?: string }): string[] {
-  const args = ["tab", "create", "--label", label, "--no-focus"];
-  if (options?.cwd) args.push("--cwd", options.cwd);
-  return args;
 }
 
 /** `pane run <pane> <command>` — atomic text + Enter. */
@@ -632,6 +666,27 @@ export function getHerdrParentPaneId(): string | null {
 }
 
 /**
+ * The parent pane id, or a loud same-tab-only error (F6/F9).
+ *
+ * A placement without a parent id would let herdr resolve the *current* pane,
+ * which may belong to another workspace/tab (measured live: a pane-less split
+ * created a pane in the user's workspace while the probe's own tab was
+ * untouched — .IDE_Plans/probe-v383/phase0-evidence.md §E-5).
+ */
+export function requireHerdrParentPaneId(env: NodeJS.ProcessEnv = process.env): string {
+  const parent = env.HERDR_PANE_ID?.trim();
+  if (parent) return parent;
+  throw new Error(
+    [
+      "Refusing to place a herdr pane without HERDR_PANE_ID.",
+      "Same-tab-only (v3.8.3): a pane split without an explicit pane would target",
+      "herdr's current pane, which may not belong to this session's tab.",
+      "Start pi inside the herdr pane that should own the subagent panes.",
+    ].join("\n"),
+  );
+}
+
+/**
  * Current pane identity, env-first (herdr injects it) with a `pane current`
  * fallback for older builds that do not set all three variables.
  */
@@ -662,6 +717,216 @@ export function getHerdrCurrentPaneInfo(): {
 }
 
 // ── Layout geometry: planning (pure) + execution ────────────────────────────
+
+// ── Managed panes, finished detection, placement lock ──────────────────────
+
+interface HerdrManagedPaneRecord {
+  createdAt: number;
+  started: boolean;
+}
+
+/**
+ * Panes this process created for subagents, oldest first (EC-3 accounting).
+ *
+ * Only a pane in here can ever be reclaimed: a foreign pane, a persistent
+ * scout without the exit sentinel, and the parent are all untouchable.
+ */
+const herdrManagedPanes = new Map<string, HerdrManagedPaneRecord>();
+
+/** Register a pane this plugin just created (LRU-capped, oldest evicted). */
+export function noteHerdrManagedPane(pane: string, now = Date.now()): void {
+  if (!pane) return;
+  herdrManagedPanes.delete(pane);
+  herdrManagedPanes.set(pane, { createdAt: now, started: false });
+  while (herdrManagedPanes.size > HERDR_MANAGED_PANE_LIMIT) {
+    const oldest = herdrManagedPanes.keys().next();
+    if (oldest.done) break;
+    herdrManagedPanes.delete(oldest.value);
+  }
+}
+
+/** Mark a managed pane as carrying a launched subagent. */
+export function noteHerdrPaneStarted(pane: string): void {
+  const record = herdrManagedPanes.get(pane);
+  if (record) record.started = true;
+}
+
+/** Drop a pane from the registry (closed, or gone from herdr). */
+export function forgetHerdrManagedPane(pane: string): void {
+  herdrManagedPanes.delete(pane);
+}
+
+/** Managed pane ids, oldest first. */
+export function listHerdrManagedPanes(): string[] {
+  return [...herdrManagedPanes.keys()];
+}
+
+export function herdrManagedPaneCount(): number {
+  return herdrManagedPanes.size;
+}
+
+export function resetHerdrManagedPanesForTests(): void {
+  herdrManagedPanes.clear();
+}
+
+/** The exit sentinel the launch script echoes: `__SUBAGENT_DONE_<code>__`. */
+export const HERDR_EXIT_SENTINEL_RE = /__SUBAGENT_DONE_\d+__/;
+
+/**
+ * True when a managed pane holds a *finished* subagent: created by this plugin,
+ * a subagent was launched in it, and the exit sentinel is on screen.
+ *
+ * A persistent/interactive scout has no sentinel, so it is never reclaimable;
+ * any read failure answers false — never reclaim on doubt (F1a/F6).
+ */
+export function isHerdrSurfaceFinished(
+  surface: string,
+  deps: {
+    isManaged?: (pane: string) => boolean;
+    isStarted?: (pane: string) => boolean;
+    readScreen?: (pane: string) => string;
+  } = {},
+): boolean {
+  const isManaged = deps.isManaged ?? ((pane: string) => herdrManagedPanes.has(pane));
+  const isStarted =
+    deps.isStarted ?? ((pane: string) => herdrManagedPanes.get(pane)?.started === true);
+  const readScreen = deps.readScreen ?? ((pane: string) => readHerdrScreen(pane, 200));
+  if (!isManaged(surface) || !isStarted(surface)) return false;
+  try {
+    return HERDR_EXIT_SENTINEL_RE.test(readScreen(surface));
+  } catch {
+    return false;
+  }
+}
+
+/** Path of the cross-process placement lock (next to the herdr socket, F4a). */
+export function getHerdrPlacementLockPath(env: NodeJS.ProcessEnv = process.env): string {
+  const socket = env.HERDR_SOCKET_PATH?.trim();
+  const base = socket ? path.dirname(socket) : os.tmpdir();
+  return path.join(base, "pi-subagent-herdr-placement.lock");
+}
+
+export function getHerdrPlacementLockTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntEnv(
+    env,
+    "PI_SUBAGENT_HERDR_PLACEMENT_TIMEOUT_MS",
+    HERDR_PLACEMENT_LOCK_DEFAULT_TIMEOUT_MS,
+  );
+}
+
+export function getHerdrPlacementStaleMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntEnv(
+    env,
+    "PI_SUBAGENT_HERDR_PLACEMENT_STALE_MS",
+    HERDR_PLACEMENT_LOCK_DEFAULT_STALE_MS,
+  );
+}
+
+/** Synchronous sleep that does not spin the CPU (throwaway shared buffer). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Age of the lock file in ms, or null when it vanished / is unreadable. */
+function herdrLockAgeMs(lockPath: string, now: () => number): number | null {
+  try {
+    return now() - fs.statSync(lockPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+/** Remove the lock file. Never throws (idempotent). */
+export function releaseHerdrPlacementLock(lockPath: string): void {
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // Already gone - nothing to release.
+  }
+}
+
+export interface HerdrPlacementLockOptions {
+  path?: string;
+  timeoutMs?: number;
+  staleMs?: number;
+  sleep?: (ms: number) => void;
+  now?: () => number;
+}
+
+/**
+ * Take the placement lock (F4a).
+ *
+ * `fs.openSync(path, "wx")` is the atomic test-and-set. Returns a release
+ * handle, or null when the bounded wait elapsed — the caller then proceeds
+ * WITHOUT the lock, because a serialisation failure must never fail a spawn.
+ * A lock older than the stale budget is stolen once (its owner died).
+ */
+export function acquireHerdrPlacementLock(
+  options: HerdrPlacementLockOptions = {},
+): { path: string; stale: boolean; release: () => void } | null {
+  const lockPath = options.path ?? getHerdrPlacementLockPath();
+  const timeoutMs = options.timeoutMs ?? getHerdrPlacementLockTimeoutMs();
+  const staleMs = options.staleMs ?? getHerdrPlacementStaleMs();
+  const now = options.now ?? (() => Date.now());
+  const sleep = options.sleep ?? sleepSync;
+
+  const deadline = now() + timeoutMs;
+  let stole = false;
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      try {
+        fs.writeSync(fd, `${process.pid} ${now()}\n`);
+      } finally {
+        fs.closeSync(fd);
+      }
+      return { path: lockPath, stale: stole, release: () => releaseHerdrPlacementLock(lockPath) };
+    } catch (error) {
+      // Any error other than "already locked" means the lock is unusable (bad
+      // directory, permissions): proceed unserialised rather than fail.
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") return null;
+    }
+
+    if (!stole) {
+      const age = herdrLockAgeMs(lockPath, now);
+      if (age !== null && age > staleMs) {
+        stole = true;
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          // Someone else won the race - just loop and retry the open.
+        }
+        continue;
+      }
+    }
+
+    if (now() >= deadline) return null;
+    sleep(25);
+  }
+}
+
+/**
+ * Run `fn` under the placement lock. Always released; a timeout degrades to an
+ * unlocked run with a warning rather than a failed spawn (F4a).
+ */
+export function withHerdrPlacementLock<T>(
+  fn: () => T,
+  options: HerdrPlacementLockOptions = {},
+): T {
+  const lock = acquireHerdrPlacementLock(options);
+  if (!lock) {
+    process.emitWarning(
+      "herdr placement lock not acquired within the timeout; proceeding unserialised.",
+      { code: "PI_HERDR_PLACEMENT_LOCK_TIMEOUT" },
+    );
+    return fn();
+  }
+  try {
+    return fn();
+  } finally {
+    lock.release();
+  }
+}
 
 /** Round a boundary amount: herdr takes floats, sub-pixel drift is noise. */
 function roundHerdrAmount(amount: number): number {
@@ -777,6 +1042,40 @@ export function planHerdrColumnSteps(
 }
 
 /**
+ * The region the parent's own spine lives in (F7).
+ *
+ * Normally the whole tab area; when the tab itself is split into rows, the
+ * smallest full-width `down`-split child rect that contains the parent. Pure.
+ */
+function herdrParentRowRegion(
+  snapshot: HerdrLayoutSnapshot,
+  parent: HerdrPanePlacement,
+): HerdrPaneRect {
+  let best: HerdrPaneRect | null = null;
+  for (const split of snapshot.splits) {
+    if (split.direction !== "down") continue;
+    if (split.rect.x !== snapshot.area.x || split.rect.width !== snapshot.area.width) continue;
+    const topHeight = Math.floor(split.rect.height * split.ratio);
+    const regions: HerdrPaneRect[] = [
+      { x: split.rect.x, y: split.rect.y, width: split.rect.width, height: topHeight },
+      {
+        x: split.rect.x,
+        y: split.rect.y + topHeight,
+        width: split.rect.width,
+        height: split.rect.height - topHeight,
+      },
+    ];
+    for (const region of regions) {
+      const contains =
+        parent.rect.y >= region.y &&
+        parent.rect.y + parent.rect.height <= region.y + region.height + 1;
+      if (contains && (!best || region.height < best.height)) best = region;
+    }
+  }
+  return best ?? snapshot.area;
+}
+
+/**
  * Steps that pin the parent at HERDR_PARENT_WIDTH_SHARE of the tab and split
  * the rest evenly across the right-hand columns.
  *
@@ -800,12 +1099,16 @@ export function planHerdrWidthSteps(
   const columnWidth = (snapshot.area.width * HERDR_PARENT_WIDTH_SHARE) / columnCount;
   if (columnWidth < minColumnWidth) return [];
 
+  // F7: the spine is scoped to the parent's OWN row region. A tab split into
+  // rows has no full-height splits, and the old full-tab filter made this pass
+  // bail silently, leaving the parent at 25% (probe §E-3).
+  const region = herdrParentRowRegion(snapshot, parent);
   const spine = snapshot.splits
     .filter(
       (split) =>
         split.direction === "right" &&
-        split.rect.y === snapshot.area.y &&
-        split.rect.height === snapshot.area.height,
+        split.rect.y === region.y &&
+        split.rect.height === region.height,
     )
     .sort((a, b) => b.rect.width - a.rect.width);
   // Anything but one spine split per column is a shape we do not manage.
@@ -818,6 +1121,8 @@ export function planHerdrWidthSteps(
     const delta = target - split.ratio;
     if (Math.abs(delta) * split.rect.width < HERDR_MIN_RESIZE_EXTENT) continue;
     const boundary = herdrSplitBoundary(split);
+    // F9: never move a boundary that lies left of the parent's right edge.
+    if (boundary < parent.rect.x + parent.rect.width - 1) continue;
     const pane =
       delta > 0 ? herdrPaneEndingAt(snapshot, boundary) : herdrPaneStartingAt(snapshot, boundary);
     if (!pane) continue;
@@ -867,8 +1172,10 @@ export function planHerdrGeometrySteps(
  *
  * 1. no usable geometry / no column yet -> split the parent right (50/50).
  * 2. column can still hold a legible pane -> split its bottom pane down.
- * 3. column cannot -> new column (parent right), unless that column would be
- *    narrower than minColumnWidth, in which case the caller uses a new tab.
+ * 3. column cannot -> a new column (parent right), unless that column would be
+ *    narrower than minColumnWidth, in which case the plan is `overflow`: a
+ *    SIGNAL for the caller to reclaim a finished pane or degrade in-tab
+ *    (F1a/F5a — this plugin never opens a tab).
  */
 export function planHerdrScoutPlacement(
   snapshot: HerdrLayoutSnapshot | null,
@@ -909,13 +1216,20 @@ export function planHerdrScoutPlacement(
   const columnCount = columns.length + 1;
   const columnWidth = (snapshot.area.width * HERDR_PARENT_WIDTH_SHARE) / columnCount;
   if (columnWidth < minColumnWidth) {
+    // Same-tab-only (F5a): never a tab. Offer the oldest finished pane in this
+    // column for reclaim; the caller closes it and re-plans. With nothing to
+    // reclaim it degrades inside the tab (F1a/F6).
+    const finished = options.finishedPaneIds ?? [];
+    const reclaimPane =
+      finished.find((pane) => target.panes.some((placed) => placed.paneId === pane)) ?? null;
     return {
-      mode: "new-tab",
-      splitPane: null,
-      splitDirection: "right",
-      splitRatio: HERDR_PARENT_WIDTH_SHARE,
+      mode: "overflow",
+      splitPane: anchor.paneId,
+      splitDirection: "down",
+      splitRatio: 0.5,
       resizes: [],
-      reason: "width-guard",
+      reason: reclaimPane ? "overflow-reclaim" : "overflow-crowded",
+      reclaimPane,
     };
   }
 
@@ -935,15 +1249,20 @@ export function planHerdrScoutPlacement(
  * Execute a placement: split, then run the geometry pass (`herdr pane layout`
  * -> pure steps -> `pane resize`), at most HERDR_LAYOUT_MAX_PASSES times.
  *
- * Returns the new pane id, or null when the caller must fall back (new tab or
- * a refused/failed split). Geometry failures are swallowed: a resize can never
- * break a spawn, and `server_not_running` always propagates.
+ * Returns the new pane id, or null when the caller must fall back (in-tab
+ * overflow reclaim/degrade, or a refused/failed split) — never a new tab.
+ * Geometry failures are swallowed: a resize can never break a spawn, and
+ * `server_not_running` always propagates.
  */
 export function applyHerdrLayoutPlan(
   plan: HerdrScoutPlacement,
   options: { parentPaneId: string; cwd?: string; minPaneHeight?: number; minColumnWidth?: number },
 ): string | null {
-  if (plan.mode === "new-tab" || !plan.splitPane) return null;
+  if (!plan.splitPane) return null;
+  // F1a: an overflow plan is a SIGNAL, not an action. The caller decides
+  // between reclaiming a finished pane and degrading in-tab (with the height
+  // guard relaxed), because only it can read the screen and close a pane.
+  if (plan.mode === "overflow") return null;
 
   let paneId: string;
   try {
@@ -961,16 +1280,44 @@ export function applyHerdrLayoutPlan(
     return null;
   }
 
-  const scope: HerdrGeometryScope = plan.mode === "new-column" ? "layout" : "column";
-  const geometryOptions: HerdrGeometryOptions = {
+  // Direction invariant (F3): a scout pane belongs RIGHT of the parent. A
+  // resize cannot reorder panes, so a reversed result is repaired by closing
+  // our own fresh pane and splitting the parent right instead (one retry).
+  const kept = enforceHerdrSplitDirection(paneId, options.parentPaneId, { cwd: options.cwd });
+  if (!kept) return null;
+  paneId = kept;
+
+  const geometryOptions = {
     parentPaneId: options.parentPaneId,
-    scope,
     minPaneHeight: options.minPaneHeight,
     minColumnWidth: options.minColumnWidth,
   };
+  for (const scope of herdrPlacementGeometryScopes(plan)) {
+    runHerdrGeometryPasses({ ...geometryOptions, scope });
+  }
 
-  for (let pass = 1; pass <= HERDR_LAYOUT_MAX_PASSES; pass += 1) {
-    const steps = planHerdrGeometrySteps(getHerdrPaneLayout(options.parentPaneId), geometryOptions);
+  return paneId;
+}
+
+/**
+ * Geometry passes a placement needs, in order (pure).
+ *
+ * `new-column` pins the widths once; a `no-geometry` plan split the parent
+ * without a snapshot, so it needs a layout-scope pass afterwards or the parent
+ * stays at 25% (F8, probe §E-4). Everything else equalises the column.
+ */
+export function herdrPlacementGeometryScopes(plan: HerdrScoutPlacement): HerdrGeometryScope[] {
+  if (plan.mode === "new-column") return ["layout"];
+  return plan.reason === "no-geometry" ? ["column", "layout"] : ["column"];
+}
+
+/** Run the resize passes until a pass is a no-op (or the pass budget is used). */
+function runHerdrGeometryPasses(
+  options: HerdrGeometryOptions,
+  passes = HERDR_LAYOUT_MAX_PASSES,
+): void {
+  for (let pass = 1; pass <= passes; pass += 1) {
+    const steps = planHerdrGeometrySteps(getHerdrPaneLayout(options.parentPaneId), options);
     if (steps.length === 0) break;
     for (const step of steps) {
       try {
@@ -981,8 +1328,46 @@ export function applyHerdrLayoutPlan(
       }
     }
   }
+}
 
-  return paneId;
+/**
+ * Keep a fresh pane only when it is not left of the parent (F3).
+ *
+ * Returns the pane to keep (`paneId` unchanged, or a replacement created by
+ * re-splitting the parent right), or null when the repair could not produce a
+ * pane — the caller then falls back instead of running a dead surface.
+ */
+function enforceHerdrSplitDirection(
+  paneId: string,
+  parentPaneId: string,
+  options: { cwd?: string } = {},
+): string | null {
+  const snapshot = getHerdrPaneLayout(parentPaneId);
+  const parent = snapshot?.panes.find((pane) => pane.paneId === parentPaneId);
+  const created = snapshot?.panes.find((pane) => pane.paneId === paneId);
+  // No snapshot (or the pane is not visible yet): keep what herdr gave us.
+  if (!parent || !created || created.rect.x >= parent.rect.x) return paneId;
+
+  forgetHerdrManagedPane(paneId);
+  try {
+    closeHerdrSurface(paneId);
+  } catch {
+    return paneId;
+  }
+  try {
+    return extractHerdrPaneId(
+      herdrExec(
+        buildHerdrSplitArgs(parentPaneId, "right", {
+          cwd: options.cwd,
+          ratio: HERDR_PARENT_WIDTH_SHARE,
+        }),
+      ),
+      "pane split",
+    );
+  } catch (error) {
+    if (isHerdrErrorCode(error, "server_not_running")) throw error;
+    return null;
+  }
 }
 
 // ── Surface creation ────────────────────────────────────────────────────────
@@ -1000,54 +1385,84 @@ function renameHerdrPane(pane: string, name: string): void {
  * scout 1 splits the parent RIGHT 50/50, later scouts stack DOWN inside that
  * column, and a resize pass keeps the column even and the parent at ~50%. A new
  * column starts only when the current one can no longer hold a legible pane; a
- * column too narrow to add another falls back to a fresh tab.
+ * column too narrow to add another reclaims a finished pane, or (as the last
+ * resort) degrades inside the tab.
  *
- * Every step degrades: a refused split falls back to a plain parent split, then
- * to `tab create`. `--no-focus` keeps the user's focus on the parent, which is
- * what makes parallel spawns usable.
+ * SAME-TAB-ONLY (v3.8.3): this never creates a herdr tab. A placement that
+ * cannot land inside the tab fails loudly instead (F5a/F6). `--no-focus` keeps
+ * the user's focus on the parent, which is what makes parallel spawns usable.
+ *
+ * The whole placement runs under the cross-process placement lock so two pi
+ * sessions spawning into the same tab cannot interleave their split + resize
+ * passes (F4a).
  */
 export function createHerdrSurface(name: string): string {
-  const parent = getHerdrParentPaneId();
+  return withHerdrPlacementLock(() => createHerdrSurfaceLocked(name));
+}
+
+function createHerdrSurfaceLocked(name: string): string {
+  // F9: without a parent id herdr would resolve the CALLER's current pane, so
+  // refuse before emitting any argv (never touch a foreign pane).
+  const parent = requireHerdrParentPaneId();
   const cwd = process.cwd();
-  const placementOptions: HerdrPlacementOptions = {
-    parentPaneId: parent ?? "",
+  const baseOptions: HerdrPlacementOptions = {
+    parentPaneId: parent,
     minPaneHeight: getHerdrMinPaneHeight(),
     minColumnWidth: getHerdrMinColumnWidth(),
   };
-  const attempt = (): {
-    paneId: string | null;
-    mode: HerdrScoutPlacementMode;
-    reason: string;
-    staleAnchor: boolean;
-  } => {
-    const plan = planHerdrScoutPlacement(
-      parent ? getHerdrPaneLayout(parent) : null,
-      placementOptions,
-    );
-    return {
-      paneId: applyHerdrLayoutPlan(plan, { ...placementOptions, cwd }),
-      mode: plan.mode,
-      reason: plan.reason,
-      // Only a column-pane split can lose its anchor to a closing subagent.
-      staleAnchor: plan.mode === "stack" && plan.splitPane !== placementOptions.parentPaneId,
-    };
+
+  const runOnce = (finishedPaneIds: string[] = []) => {
+    const plan = planHerdrScoutPlacement(getHerdrPaneLayout(parent), {
+      ...baseOptions,
+      finishedPaneIds,
+    });
+    return { plan, paneId: applyHerdrLayoutPlan(plan, { ...baseOptions, cwd }) };
   };
 
-  let result = attempt();
-  if (!result.paneId && result.staleAnchor) result = attempt();
-  let paneId = result.paneId;
+  /** Managed panes whose subagent already finished, oldest first (EC-3/F1a). */
+  const collectFinished = (): string[] =>
+    listHerdrManagedPanes().filter((pane) => pane !== parent && isHerdrSurfaceFinished(pane));
 
-  if (!paneId && result.mode !== "new-tab") {
-    // The planner wanted a split and herdr refused it (no room, stale anchor):
-    // last resort before a new tab is a plain parent split.
+  let { plan, paneId } = runOnce();
+  if (!paneId && plan.mode === "stack" && plan.splitPane !== parent) {
+    // Only a column-pane split can lose its anchor to a closing subagent, so
+    // re-read the layout once before giving up on the plan.
+    ({ plan, paneId } = runOnce());
+  }
+
+  if (!paneId && plan.mode === "overflow") {
+    const finished = collectFinished();
+    const reclaim = finished.length > 0 ? runOnce(finished).plan.reclaimPane : null;
+    if (reclaim) {
+      try {
+        closeHerdrSurface(reclaim);
+        ({ plan, paneId } = runOnce(finished));
+      } catch {
+        // A refused reclaim (gone/foreign pane) degrades to the in-tab fix below.
+      }
+    }
+    if (!paneId) {
+      // Nothing reclaimable: every pane in the column is live or persistent.
+      // Degrade INSIDE the tab — split the column bottom down at 0.5 and run
+      // one layout pass with the height guard relaxed. Sub-min rows are the
+      // documented price of same-tab-only (F1a/F6).
+      plan = {
+        mode: "stack",
+        splitPane: plan.splitPane,
+        splitDirection: "down",
+        splitRatio: 0.5,
+        resizes: [],
+        reason: "overflow-degrade",
+      };
+      paneId = applyHerdrLayoutPlan(plan, { ...baseOptions, cwd, minPaneHeight: 0 });
+    }
+  }
+
+  if (!paneId) {
+    // Last resort inside the tab: a plain parent split (never a tab — F5a).
     try {
       paneId = extractHerdrPaneId(
-        herdrExec(
-          buildHerdrSplitArgs(parent ?? undefined, "right", {
-            cwd,
-            ratio: HERDR_PARENT_WIDTH_SHARE,
-          }),
-        ),
+        herdrExec(buildHerdrSplitArgs(parent, "right", { cwd, ratio: HERDR_PARENT_WIDTH_SHARE })),
         "pane split",
       );
     } catch (error) {
@@ -1056,20 +1471,22 @@ export function createHerdrSurface(name: string): string {
   }
 
   if (!paneId) {
-    // Either the planner hit the width guard, or every split attempt failed.
-    try {
-      paneId = extractHerdrRootPaneId(
-        herdrExec(buildHerdrTabCreateArgs(name, { cwd })),
-        "tab create",
-      );
-    } catch (tabError) {
-      const message = tabError instanceof Error ? tabError.message : String(tabError);
-      throw new Error(
-        `Could not create a herdr pane for "${name}".\nplacement: ${result.mode} (${result.reason})\ntab create: ${message}`,
-      );
-    }
+    // F6: the documented loud last resort. No tab is ever created.
+    throw new Error(
+      [
+        `Could not place a herdr pane for "${name}" inside the current tab.`,
+        `parent pane: ${parent}`,
+        `placement: ${plan.mode} (${plan.reason})`,
+        "Same-tab-only is enforced since v3.8.3: this plugin never creates a herdr tab.",
+        "The tab has no room for another split, and no finished pane in the target",
+        "column could be reclaimed.",
+        "Fix: close finished scout panes in this tab, enlarge the tab, or lower",
+        "PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT.",
+      ].join("\n"),
+    );
   }
 
+  noteHerdrManagedPane(paneId);
   renameHerdrPane(paneId, name);
   return paneId;
 }
@@ -1083,11 +1500,12 @@ export function createHerdrSurfaceSplit(
   direction: HerdrSplitDirection,
   fromSurface?: string,
 ): string {
-  const target = fromSurface ?? getHerdrParentPaneId();
+  const target = fromSurface ?? requireHerdrParentPaneId();
   const paneId = extractHerdrPaneId(
-    herdrExec(buildHerdrSplitArgs(target ?? undefined, direction, { cwd: process.cwd() })),
+    herdrExec(buildHerdrSplitArgs(target, direction, { cwd: process.cwd() })),
     "pane split",
   );
+  noteHerdrManagedPane(paneId);
   renameHerdrPane(paneId, name);
   return paneId;
 }
@@ -1097,6 +1515,8 @@ export function createHerdrSurfaceSplit(
 /** Deliver a shell command atomically (text + Enter in one socket request). */
 export function sendHerdrCommand(surface: string, command: string): void {
   herdrExec(buildHerdrPaneRunArgs(surface, command));
+  // EC-3: only a pane whose launch command was delivered can be "finished".
+  noteHerdrPaneStarted(surface);
 }
 
 /**
@@ -1237,9 +1657,13 @@ export function closeHerdrSurface(surface: string): void {
   try {
     herdrExec(["pane", "close", surface]);
   } catch (error) {
-    if (isHerdrErrorCode(error, "pane_not_found")) return;
+    if (isHerdrErrorCode(error, "pane_not_found")) {
+      forgetHerdrManagedPane(surface);
+      return;
+    }
     throw error;
   }
+  forgetHerdrManagedPane(surface);
 }
 
 // ── Renames (cosmetic, best-effort) ─────────────────────────────────────────
@@ -1339,7 +1763,6 @@ export const __herdrTest__ = {
   toHerdrError,
   herdrSplitDirection,
   buildHerdrSplitArgs,
-  buildHerdrTabCreateArgs,
   buildHerdrPaneRunArgs,
   buildHerdrPaneReadArgs,
   buildHerdrAgentReadArgs,
@@ -1356,7 +1779,24 @@ export const __herdrTest__ = {
   parseHerdrJson,
   extractHerdrPaneId,
   extractHerdrRootPaneId,
+  requireHerdrParentPaneId,
+  herdrPlacementGeometryScopes,
   herdrEnvDetected,
   isHerdrErrorCode,
   herdrErrorHint,
+  // Managed-pane registry + finished detection (EC-3/F1a).
+  noteHerdrManagedPane,
+  noteHerdrPaneStarted,
+  forgetHerdrManagedPane,
+  listHerdrManagedPanes,
+  herdrManagedPaneCount,
+  resetHerdrManagedPanesForTests,
+  isHerdrSurfaceFinished,
+  // Cross-process placement lock (F4a).
+  getHerdrPlacementLockPath,
+  getHerdrPlacementLockTimeoutMs,
+  getHerdrPlacementStaleMs,
+  acquireHerdrPlacementLock,
+  releaseHerdrPlacementLock,
+  withHerdrPlacementLock,
 };
