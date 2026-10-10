@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -84,6 +84,7 @@ import {
   HERDR_DEFAULT_MIN_COLUMN_WIDTH,
   isHerdrAvailable,
   isHerdrErrorCode,
+  createHerdrSurface,
   closeHerdrSurface,
   HerdrError,
 } from "../pi-extension/subagents/herdr.ts";
@@ -2632,25 +2633,28 @@ describe("herdr.ts", () => {
         "--cwd",
         "/tmp/x",
       ]);
-      assert.deepEqual(testApi.buildHerdrSplitArgs(undefined, "down"), [
+      // F9 (v3.8.3): the pane argument is MANDATORY. A pane-less `pane split`
+      // makes herdr target the caller's current pane - possibly a foreign one
+      // (measured live, probe phase0-evidence.md §E-5).
+      assert.deepEqual(testApi.buildHerdrSplitArgs("w1:p1", "down"), [
         "pane",
         "split",
+        "w1:p1",
         "--direction",
         "down",
         "--no-focus",
       ]);
+      assert.throws(() => testApi.buildHerdrSplitArgs("", "down"), /pane-less/);
     });
 
-    it("builds the tab-create fallback without focus", () => {
-      assert.deepEqual(testApi.buildHerdrTabCreateArgs("Scout", { cwd: "/tmp/y" }), [
-        "tab",
-        "create",
-        "--label",
-        "Scout",
-        "--no-focus",
-        "--cwd",
-        "/tmp/y",
-      ]);
+    it("has no way to build a tab-creating argv (same-tab-only, F5a)", () => {
+      assert.equal(testApi.buildHerdrTabCreateArgs, undefined);
+      const exported = Object.keys(herdrModule);
+      assert.equal(
+        exported.some((name) => /tab.?create|create.?tab/i.test(name)),
+        false,
+        `no tab-create helper may be exported: ${exported.join(", ")}`,
+      );
     });
 
     it("delivers commands atomically through pane run", () => {
@@ -2855,7 +2859,7 @@ describe("herdr.ts", () => {
       assert.equal(fromSingle.splitDirection, "down");
     });
 
-    it("starts a new column when the column is full, and a new tab when too narrow", () => {
+    it("starts a new column when the column is full, and overflows in-tab when too narrow (F1a/F5a)", () => {
       const full = snapshot({ panes: withParent(columnPanes([9, 9, 9, 9, 9])) });
       const plan = planHerdrScoutPlacement(full, { parentPaneId: "w1:p1" });
       // 45 / 6 = 7 rows per pane -> below the 8-row guard.
@@ -2866,12 +2870,83 @@ describe("herdr.ts", () => {
       assert.equal(plan.splitRatio, 0.5);
       assert.deepEqual(plan.resizes, []);
 
+      // F1a/F5a (v3.8.3): too narrow for another column means OVERFLOW inside
+      // this tab, never a tab. With nothing reclaimable the plan still targets
+      // a pane of this tab (the column bottom) so the caller can degrade.
       const narrow = planHerdrScoutPlacement(full, { parentPaneId: "w1:p1", minColumnWidth: 50 });
-      assert.equal(narrow.mode, "new-tab");
-      assert.equal(narrow.reason, "width-guard");
-      assert.equal(narrow.splitPane, null);
-      // A new-tab plan touches herdr not at all.
-      assert.equal(applyHerdrLayoutPlan(narrow, { parentPaneId: "w1:p1" }), null);
+      assert.equal(narrow.mode, "overflow");
+      assert.equal(narrow.reason, "overflow-crowded");
+      assert.equal(narrow.reclaimPane, null);
+      assert.equal(narrow.splitPane, "w1:c4", "the overflow anchor is the column bottom");
+      assert.equal(narrow.splitDirection, "down");
+
+      const reclaimable = planHerdrScoutPlacement(full, {
+        parentPaneId: "w1:p1",
+        minColumnWidth: 50,
+        finishedPaneIds: ["w1:c2"],
+      });
+      assert.equal(reclaimable.mode, "overflow");
+      assert.equal(reclaimable.reason, "overflow-reclaim");
+      assert.equal(reclaimable.reclaimPane, "w1:c2", "the oldest finished pane of the column");
+
+      // A finished pane OUTSIDE the target column frees no room where we need it.
+      const elsewhere = planHerdrScoutPlacement(full, {
+        parentPaneId: "w1:p1",
+        minColumnWidth: 50,
+        finishedPaneIds: ["w9:p9"],
+      });
+      assert.equal(elsewhere.reclaimPane, null);
+    });
+
+    it("pins the parent's own row when the tab is split into rows (F7)", () => {
+      // Regression (probe §E-3): the width pass required full-tab-height splits,
+      // so inside a row it bailed and the parent stayed at 25% (47/187) with an
+      // uneven column split.
+      const row = snapshot({
+        panes: [
+          pane("w1:p1", 0, 0, 47, 22),
+          pane("w1:c1", 47, 0, 47, 22),
+          pane("w1:c2", 94, 0, 93, 22),
+          pane("w1:p9", 0, 22, 187, 23),
+        ],
+        splits: [
+          split("sRow", "down", 0.5, 0, 0, 187, 45),
+          split("sOuter", "right", 0.25, 0, 0, 187, 22),
+          split("sInner", "right", 1 / 3, 46.75, 0, 140.25, 22),
+        ],
+      });
+      const columns = layoutHerdrColumns(row, "w1:p1");
+      assert.equal(columns.length, 2, "two columns live in the parent's row");
+
+      const steps = planHerdrWidthSteps(row, columns, "w1:p1");
+      assert.equal(steps.length, 2, "the row spine is found (the old filter found none)");
+      assert.equal(steps[0].pane, "w1:p1");
+      assert.equal(steps[0].direction, "right");
+      assert.equal(steps[0].amount, 0.5);
+      // The other row is never touched.
+      assert.deepEqual(
+        steps.filter((step) => step.pane === "w1:p9"),
+        [],
+      );
+    });
+
+    it("re-runs the pass in layout scope when the plan had no geometry (F8)", () => {
+      const noGeometry = planHerdrScoutPlacement(null, { parentPaneId: "w1:p1" });
+      assert.equal(noGeometry.reason, "no-geometry");
+      assert.deepEqual(testApi.herdrPlacementGeometryScopes(noGeometry), ["column", "layout"]);
+
+      const firstColumn = planHerdrScoutPlacement(
+        snapshot({ panes: [pane("w1:p1", 0, 0, 187, 45)] }),
+        { parentPaneId: "w1:p1" },
+      );
+      assert.deepEqual(testApi.herdrPlacementGeometryScopes(firstColumn), ["column"]);
+
+      const newColumn = planHerdrScoutPlacement(
+        snapshot({ panes: withParent(columnPanes([9, 9, 9, 9, 9])) }),
+        { parentPaneId: "w1:p1" },
+      );
+      assert.equal(newColumn.mode, "new-column");
+      assert.deepEqual(testApi.herdrPlacementGeometryScopes(newColumn), ["layout"]);
     });
 
     it("honours the guards as arguments, so sizing is testable", () => {
@@ -3092,7 +3167,120 @@ describe("herdr.ts", () => {
     });
   });
 
+  describe("managed panes and the placement lock", () => {
+    it("tracks managed panes oldest-first and forgets them", () => {
+      testApi.resetHerdrManagedPanesForTests();
+      testApi.noteHerdrManagedPane("w1:p2", 1);
+      testApi.noteHerdrManagedPane("w1:p3", 2);
+      assert.deepEqual(testApi.listHerdrManagedPanes(), ["w1:p2", "w1:p3"]);
+      assert.equal(testApi.herdrManagedPaneCount(), 2);
+      testApi.forgetHerdrManagedPane("w1:p2");
+      assert.deepEqual(testApi.listHerdrManagedPanes(), ["w1:p3"]);
+      testApi.resetHerdrManagedPanesForTests();
+      assert.equal(testApi.herdrManagedPaneCount(), 0);
+    });
+
+    it("only calls a managed, started pane with the exit sentinel finished (EC-3)", () => {
+      testApi.resetHerdrManagedPanesForTests();
+      testApi.noteHerdrManagedPane("w1:p2", 1);
+      assert.equal(testApi.isHerdrSurfaceFinished("w1:p2"), false, "no subagent launched yet");
+      assert.equal(testApi.isHerdrSurfaceFinished("w9:p9"), false, "not ours to reclaim");
+
+      testApi.noteHerdrPaneStarted("w1:p2");
+      const withScreen = (screen: string) => ({ readScreen: () => screen });
+      assert.equal(
+        testApi.isHerdrSurfaceFinished("w1:p2", withScreen("bye__SUBAGENT_DONE_0__")),
+        true,
+      );
+      assert.equal(
+        testApi.isHerdrSurfaceFinished("w1:p2", withScreen("still working")),
+        false,
+        "a live or persistent pane is never reclaimable",
+      );
+      assert.equal(
+        testApi.isHerdrSurfaceFinished("w1:p2", {
+          readScreen: () => {
+            throw new Error("pane read failed");
+          },
+        }),
+        false,
+        "never reclaim on a failed read",
+      );
+      testApi.resetHerdrManagedPanesForTests();
+    });
+
+    it("serialises placements with an atomic lock file and steals stale ones (F4a)", () => {
+      const dir = mkdtempSync(join(tmpdir(), "herdr-lock-"));
+      const lockPath = join(dir, "placement.lock");
+      try {
+        const first = testApi.acquireHerdrPlacementLock({ path: lockPath, timeoutMs: 1000 });
+        assert.ok(first, "the first acquire wins");
+        assert.equal(first.stale, false);
+
+        // Held: a second attempt within a tiny budget gives up instead of blocking.
+        assert.equal(
+          testApi.acquireHerdrPlacementLock({ path: lockPath, timeoutMs: 0 }),
+          null,
+          "a held lock is never taken by force (unless stale)",
+        );
+
+        first.release();
+        const second = testApi.acquireHerdrPlacementLock({ path: lockPath, timeoutMs: 1000 });
+        assert.ok(second, "release makes it available again");
+
+        // A lock older than the stale budget belonged to a dead process.
+        const past = new Date(Date.now() - 60_000);
+        utimesSync(lockPath, past, past);
+        const stolen = testApi.acquireHerdrPlacementLock({
+          path: lockPath,
+          timeoutMs: 1000,
+          staleMs: 1000,
+        });
+        assert.ok(stolen, "a stale lock is stolen");
+        assert.equal(stolen.stale, true);
+        stolen.release();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("runs the placement under the lock and always releases it", () => {
+      const dir = mkdtempSync(join(tmpdir(), "herdr-lock-"));
+      const lockPath = join(dir, "placement.lock");
+      try {
+        assert.equal(
+          testApi.withHerdrPlacementLock(() => 42, { path: lockPath }),
+          42,
+        );
+        assert.equal(existsSync(lockPath), false, "the lock file is removed in finally");
+
+        // A held lock times out, then the work still runs (never fatal).
+        const held = testApi.acquireHerdrPlacementLock({ path: lockPath, timeoutMs: 1000 });
+        const degraded = testApi.withHerdrPlacementLock(() => "ok", {
+          path: lockPath,
+          timeoutMs: 0,
+        });
+        assert.equal(degraded, "ok", "a lock timeout never fails a spawn");
+        held.release();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("safety invariants", () => {
+    it("refuses to place a pane without HERDR_PANE_ID (F6/F9)", () => {
+      const prev = process.env.HERDR_PANE_ID;
+      delete process.env.HERDR_PANE_ID;
+      try {
+        assert.throws(() => testApi.requireHerdrParentPaneId({}), /HERDR_PANE_ID/);
+        // A missing parent must fail loudly, never split herdr's current pane.
+        assert.throws(() => createHerdrSurface("Scout"), /HERDR_PANE_ID/);
+      } finally {
+        if (prev === undefined) delete process.env.HERDR_PANE_ID;
+        else process.env.HERDR_PANE_ID = prev;
+      }
+    });
     it("refuses to close the herdr parent pane", () => {
       const prev = process.env.HERDR_PANE_ID;
       process.env.HERDR_PANE_ID = "w1:p1";
@@ -3107,7 +3295,6 @@ describe("herdr.ts", () => {
     it("never builds a destructive server/tab/workspace command", () => {
       const builderOutputs = [
         testApi.buildHerdrSplitArgs("w1:p1", "right", { cwd: "/tmp" }),
-        testApi.buildHerdrTabCreateArgs("Scout", { cwd: "/tmp" }),
         testApi.buildHerdrPaneRunArgs("w1:p2", "bash /tmp/s.sh"),
         testApi.buildHerdrPaneReadArgs("w1:p2", 10),
         testApi.buildHerdrAgentReadArgs("w1:p2", 10),
@@ -3122,6 +3309,12 @@ describe("herdr.ts", () => {
       ];
 
       for (const args of builderOutputs) {
+        // F5a: no reachable argv creates a tab (same-tab-only).
+        assert.notDeepEqual(
+          args.slice(0, 2),
+          ["tab", "create"],
+          `unexpected tab create in: ${args.join(" ")}`,
+        );
         assert.equal(args.includes("stop"), false, `unexpected stop in: ${args.join(" ")}`);
         assert.equal(args.includes("close"), false, `unexpected close in: ${args.join(" ")}`);
         assert.equal(args.includes("kill"), false, `unexpected kill in: ${args.join(" ")}`);

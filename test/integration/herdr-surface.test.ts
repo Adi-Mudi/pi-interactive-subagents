@@ -14,6 +14,8 @@
  *   - the agent-facade probe (`agent get` → not an agent) and the settle no-op
  *   - closing our own pane, and the parent-pane refusal
  *   - the server is never stopped
+ *   - same-tab-only placement: never a new tab, parent stays leftmost at ~50%
+ *     (v3.8.3 — see `phase0-evidence.md` §E-5/§E-6)
  *
  * Local run (isolated, does not touch the user's herdr session):
  *   start a server with a private socket, then run this file inside one of its
@@ -76,6 +78,19 @@ function focusedPaneId(): string | null {
     return focused?.pane_id ?? null;
   } catch {
     return null;
+  }
+}
+
+function tabsOfWorkspace(workspaceId: string): string[] {
+  try {
+    const parsed = JSON.parse(herdr(["tab", "list"])) as {
+      result?: { tabs?: Array<{ tab_id?: string; workspace_id?: string }> };
+    };
+    return (parsed.result?.tabs ?? [])
+      .filter((tab) => tab.workspace_id === workspaceId)
+      .map((tab) => tab.tab_id ?? "");
+  } catch {
+    return [];
   }
 }
 
@@ -221,23 +236,253 @@ if (herdrReady) {
           `columns must be near-equal, got ${widths.join(",")}`,
         );
 
-        // A column too narrow to be usable falls back to a fresh tab and must
-        // leave the parent's tab exactly as it was.
+        // A column too narrow for another one must NOT open a tab (v3.8.3):
+        // the spawn overflows inside the parent's tab, either by reclaiming a
+        // finished pane or by degrading to a shorter split of the column.
         process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = "9999";
-        const panesBeforeFallback = widened.panes.length;
-        const tabPane = createSurface(`p4-tab-${uniqueId()}`);
-        assert.equal(paneExists(tabPane), true, "the fallback pane must exist");
+        process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = "9999";
+        const panesBeforeOverflow = widened.panes.length;
+        const overflow = createSurface(`p4-overflow-${uniqueId()}`);
+        created.push(overflow);
+        assert.equal(paneExists(overflow), true, "the overflow pane must exist");
+        const afterOverflow = getHerdrPaneLayout(parent!)!;
+        assert.equal(
+          afterOverflow.tabId,
+          before.tabId,
+          "an overflow must stay in the parent's tab, never a new one",
+        );
+        assert.equal(
+          afterOverflow.panes.length,
+          panesBeforeOverflow + 1,
+          "the overflow pane must land in the parent's tab",
+        );
+        assert.equal(
+          getHerdrPaneLayout(overflow)?.tabId,
+          before.tabId,
+          "the overflow pane must never land in a foreign tab",
+        );
+        const overflowParent = afterOverflow.panes.find(
+          (entry) => entry.paneId === parent,
+        )!.rect;
+        assert.ok(
+          Math.abs(overflowParent.width - halfTab) <= 2,
+          `overflow must not squeeze the parent, got ${overflowParent.width} of ${afterOverflow.area.width}`,
+        );
+      } finally {
+        if (prevHeight === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
+        else process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = prevHeight;
+        if (prevWidth === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH;
+        else process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = prevWidth;
+      }
+    });
+
+    it("never opens a tab, even when both guards say the tab is full (same-tab-only)", async () => {
+      const parent = getHerdrParentPaneId();
+      assert.ok(parent, "expected HERDR_PANE_ID inside a herdr pane");
+      const before = getHerdrPaneLayout(parent!);
+      assert.ok(before, "expected a `pane layout` snapshot");
+      const focusBefore = focusedPaneId();
+      const prevHeight = process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
+      const prevWidth = process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH;
+      // Hostile guards: no room to stack, no room for another column. The only
+      // legal outcomes are a reclaiming overflow or the loud error - a tab is
+      // never one of them.
+      process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = "9999";
+      process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = "9999";
+      try {
+        const spawned: string[] = [];
+        for (let index = 0; index < 3; index += 1) {
+          const surface = createSurface(`p4-notab-${uniqueId()}`);
+          created.push(surface);
+          spawned.push(surface);
+        }
+
+        const geometry = getHerdrPaneLayout(parent!)!;
+        assert.equal(geometry.tabId, before.tabId, "the spawns must not move off the parent's tab");
+        // The headline guarantee, straight from the CLI: this workspace still
+        // owns exactly one tab.
+        assert.ok(before.tabId, "expected a tab id in the layout snapshot");
+        assert.deepEqual(
+          tabsOfWorkspace(before.tabId!.split(":")[0]),
+          [before.tabId],
+          "herdr must not have gained a tab (same-tab-only)",
+        );
+        const parentRect = geometry.panes.find((entry) => entry.paneId === parent)!.rect;
+        assert.equal(parentRect.x, geometry.area.x, "the parent must stay the leftmost pane");
+        assert.ok(
+          Math.abs(parentRect.width - geometry.area.width / 2) <= 2,
+          `the parent must stay at ~50%, got ${parentRect.width} of ${geometry.area.width}`,
+        );
+        for (const surface of spawned) {
+          assert.equal(
+            getHerdrPaneLayout(surface)?.tabId,
+            before.tabId,
+            `${surface} must live in the parent's tab, never a new one`,
+          );
+          const rect = geometry.panes.find((entry) => entry.paneId === surface)!.rect;
+          assert.ok(
+            rect.x >= parentRect.x + parentRect.width - 1,
+            `${surface} must sit right of the parent, got x=${rect.x}`,
+          );
+        }
+        assert.equal(focusedPaneId(), focusBefore, "spawning must not steal focus");
+      } finally {
+        if (prevHeight === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
+        else process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = prevHeight;
+        if (prevWidth === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH;
+        else process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = prevWidth;
+      }
+    });
+
+    it("serialises a back-to-back burst without overlapping panes (EC-1)", async () => {
+      const parent = getHerdrParentPaneId();
+      assert.ok(parent, "expected HERDR_PANE_ID inside a herdr pane");
+      const before = getHerdrPaneLayout(parent!);
+      assert.ok(before, "expected a `pane layout` snapshot");
+      const focusBefore = focusedPaneId();
+
+      // `createSurface` is synchronous, so this is the closest in-process
+      // equivalent of two sessions racing: every spawn must re-read the layout,
+      // place itself in a free slot and leave the tab consistent.
+      const burst: string[] = [];
+      for (let index = 0; index < 3; index += 1) {
+        const surface = createSurface(`p4-burst-${uniqueId()}`);
+        created.push(surface);
+        burst.push(surface);
+      }
+
+      const geometry = getHerdrPaneLayout(parent!)!;
+      assert.equal(geometry.tabId, before.tabId, "a burst must not spawn a tab");
+      const parentRect = geometry.panes.find((entry) => entry.paneId === parent)!.rect;
+      assert.equal(parentRect.x, geometry.area.x, "the parent must stay leftmost");
+      assert.ok(
+        Math.abs(parentRect.width - geometry.area.width / 2) <= 2,
+        `the parent must stay at ~50%, got ${parentRect.width} of ${geometry.area.width}`,
+      );
+
+      const rects = burst.map(
+        (surface) => geometry.panes.find((entry) => entry.paneId === surface)!.rect,
+      );
+      for (const rect of rects) {
+        assert.ok(
+          rect.x >= parentRect.x + parentRect.width - 1,
+          `burst pane must sit right of the parent, got x=${rect.x}`,
+        );
+      }
+      // No two panes of the burst may occupy the same slot (the race signature).
+      for (let a = 0; a < rects.length; a += 1) {
+        for (let b = a + 1; b < rects.length; b += 1) {
+          const disjoint =
+            rects[a].x + rects[a].width <= rects[b].x + 1 ||
+            rects[b].x + rects[b].width <= rects[a].x + 1 ||
+            rects[a].y + rects[a].height <= rects[b].y + 1 ||
+            rects[b].y + rects[b].height <= rects[a].y + 1;
+          assert.ok(disjoint, `burst panes must not overlap: ${JSON.stringify(rects)}`);
+        }
+      }
+      assert.equal(focusedPaneId(), focusBefore, "spawning must not steal focus");
+    });
+
+    it("reclaims a finished pane instead of opening a tab (F1a overflow)", async () => {
+      const parent = getHerdrParentPaneId();
+      assert.ok(parent, "expected HERDR_PANE_ID inside a herdr pane");
+      const before = getHerdrPaneLayout(parent!);
+      assert.ok(before?.tabId, "expected a `pane layout` snapshot with a tab id");
+
+      // A finished subagent whose pane stayed open: the sentinel is on screen
+      // while the process is still alive (a persistent scout pane).
+      const finished = createSurface(`p4-finished-${uniqueId()}`);
+      created.push(finished);
+      await sleep(1500);
+      const dir = mkdtempSync(join(tmpdir(), "p4-reclaim-"));
+      tempDirs.push(dir);
+      const script = join(dir, "finished.sh");
+      writeFileSync(script, '#!/bin/bash\necho "__SUBAGENT_DONE_0__"\nsleep 300\n');
+      chmodSync(script, 0o755);
+      sendLongCommand(finished, `bash ${script}`);
+      await waitForScreen(finished, /__SUBAGENT_DONE_0__/, 25_000);
+      const panesBefore = getHerdrPaneLayout(parent!)!.panes.length;
+
+      // Hostile guards: no stacking room, no room for another column -> the
+      // only in-tab options are reclaim or degrade.
+      const prevHeight = process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
+      const prevWidth = process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH;
+      process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = "9999";
+      process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = "9999";
+      try {
+        const spawned = createSurface(`p4-reclaimed-${uniqueId()}`);
+        created.push(spawned);
+        await sleep(1500);
+
+        assert.equal(paneExists(spawned), true, "the replacement pane must exist");
+        assert.equal(
+          getHerdrPaneLayout(spawned)?.tabId,
+          before.tabId,
+          "the replacement must stay in the parent's tab",
+        );
+        assert.deepEqual(
+          tabsOfWorkspace(before.tabId!.split(":")[0]),
+          [before.tabId],
+          "a reclaim must not create a tab",
+        );
+        // One pane closed, one pane created: under guards that forbid both
+        // stacking and a new column, a net-zero pane count proves the reclaim
+        // path ran instead of the degrade path.
         assert.equal(
           getHerdrPaneLayout(parent!)!.panes.length,
-          panesBeforeFallback,
-          "a width-guard fallback must not touch the parent's tab",
+          panesBefore,
+          "the overflow must have reclaimed a finished pane (one out, one in)",
         );
-        const tabId = getHerdrPaneLayout(tabPane)?.tabId;
-        assert.ok(tabId && tabId !== before.tabId, "the fallback pane must live in a new tab");
-        // Close only the tab we just created (never the parent's).
-        herdr(["tab", "close", tabId!]);
-        await sleep(500);
-        assert.equal(paneExists(tabPane), false, "the fallback tab must be cleaned up");
+        const geometry = getHerdrPaneLayout(parent!)!;
+        const parentRect = geometry.panes.find((entry) => entry.paneId === parent)!.rect;
+        assert.equal(parentRect.x, geometry.area.x, "the parent must stay leftmost");
+        assert.ok(
+          Math.abs(parentRect.width - geometry.area.width / 2) <= 2,
+          `the parent must stay at ~50%, got ${parentRect.width} of ${geometry.area.width}`,
+        );
+      } finally {
+        if (prevHeight === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
+        else process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = prevHeight;
+        if (prevWidth === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH;
+        else process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = prevWidth;
+      }
+    });
+
+    it("never reclaims a pane whose subagent is still running (EC-3)", async () => {
+      const parent = getHerdrParentPaneId();
+      assert.ok(parent, "expected HERDR_PANE_ID inside a herdr pane");
+      const before = getHerdrPaneLayout(parent!);
+      assert.ok(before?.tabId, "expected a `pane layout` snapshot with a tab id");
+
+      const persistent = createSurface(`p4-persistent-${uniqueId()}`);
+      created.push(persistent);
+      await sleep(1500);
+      sendLongCommand(persistent, "while true; do echo PERSISTENT_ALIVE; sleep 5; done");
+      await waitForScreen(persistent, /PERSISTENT_ALIVE/, 20_000);
+
+      const prevHeight = process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
+      const prevWidth = process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH;
+      process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = "9999";
+      process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = "9999";
+      try {
+        const spawned = createSurface(`p4-live-${uniqueId()}`);
+        created.push(spawned);
+        await sleep(1500);
+
+        assert.equal(paneExists(spawned), true, "the new pane must exist");
+        assert.equal(
+          paneExists(persistent),
+          true,
+          "a running subagent pane must never be reclaimed",
+        );
+        assert.deepEqual(
+          tabsOfWorkspace(before.tabId!.split(":")[0]),
+          [before.tabId],
+          "the degrade path must not create a tab either",
+        );
+        const geometry = getHerdrPaneLayout(parent!)!;
+        const parentRect = geometry.panes.find((entry) => entry.paneId === parent)!.rect;
+        assert.equal(parentRect.x, geometry.area.x, "the parent must stay leftmost");
       } finally {
         if (prevHeight === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
         else process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = prevHeight;
