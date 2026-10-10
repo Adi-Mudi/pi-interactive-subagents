@@ -1280,7 +1280,7 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "ping" | "sentinel" | "error" | "timeout";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
@@ -1312,6 +1312,45 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
+/**
+ * Post-submit delivery check (F2/H1 hardening).
+ *
+ * `pane run` is fire-and-forget: if the pane shell was not ready the typed
+ * text can be dropped and the pane stays at a bare prompt. Poll the screen for
+ * `needle` (the launch script name) and report whether it ever appeared.
+ *
+ * This NEVER re-sends. A caller may only re-submit after a negative verdict
+ * here, and even then the failure is reported to the parent (never silent).
+ */
+export async function verifyCommandDelivered(
+  surface: string,
+  needle: string,
+  options: {
+    attempts?: number;
+    intervalMs?: number;
+    read?: (surface: string, lines: number) => Promise<string> | string;
+  } = {},
+): Promise<{ delivered: boolean; screen: string }> {
+  const attempts = options.attempts ?? 10;
+  const intervalMs = options.intervalMs ?? 500;
+  const readFn = options.read ?? readScreenAsync;
+  let screen = "";
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      screen = String(await readFn(surface, 200));
+    } catch {
+      screen = "";
+    }
+    if (needle !== "" && screen.includes(needle)) return { delivered: true, screen };
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  return { delivered: false, screen };
+}
+
 export const __pollForExitTest__ = { interpretExitSidecar };
 
 /**
@@ -1327,6 +1366,14 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /**
+     * Watchdog ceiling in ms. 0/undefined disables it. A launch that never
+     * landed writes no sidecar and no sentinel, so without a ceiling this
+     * loop runs forever and the parent never hears back (F2/H3).
+     */
+    maxElapsedMs?: number;
+    /** Screen reader override (tests). Defaults to `readScreenAsync`. */
+    read?: (surface: string, lines: number) => Promise<string> | string;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -1359,7 +1406,8 @@ export async function pollForExit(
 
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const readFn = options.read ?? readScreenAsync;
+      const screen = await readFn(surface, 5);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
@@ -1380,6 +1428,19 @@ export async function pollForExit(
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
     options.onTick?.(elapsed);
+
+    // Watchdog: a launch that never started produces no exit signal at all,
+    // so fail terminally and tell the parent instead of looping forever.
+    if (options.maxElapsedMs && Date.now() - start >= options.maxElapsedMs) {
+      return {
+        reason: "timeout",
+        exitCode: 124,
+        errorMessage:
+          `Subagent watchdog timeout: no exit after ${elapsed}s. ` +
+          `The launch likely never started (pane shows no pi process). ` +
+          `No re-submit was attempted (never blind-resubmit).`,
+      };
+    }
 
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) return reject(new Error("Aborted"));

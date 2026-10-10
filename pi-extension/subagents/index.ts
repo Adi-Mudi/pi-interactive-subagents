@@ -5,6 +5,7 @@ import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  appendFileSync,
   readdirSync,
   readFileSync,
   writeFileSync,
@@ -27,6 +28,7 @@ import {
   renameCurrentTab,
   renameWorkspace,
   readScreen,
+  verifyCommandDelivered,
 } from "./cmux.ts";
 
 import {
@@ -505,6 +507,8 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** False when the post-submit pane check never saw the launch script. */
+  deliveryVerified?: boolean;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -925,6 +929,53 @@ function startWidgetRefresh() {
 }
 
 /**
+ * Watchdog ceiling for a spawned subagent (ms). Default 30 min; `0` disables.
+ * A launch that never started produces no exit signal, so without this the
+ * watcher would poll forever and the parent would never be told (F2/H3).
+ */
+function getWatchdogMs(): number {
+  const raw = process.env.PI_SUBAGENT_WATCHDOG_MS;
+  if (raw === undefined) return 30 * 60 * 1000;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 30 * 60 * 1000;
+}
+
+/**
+ * Parent-facing launch note. ONLY the terminal watchdog timeout is visible to
+ * the parent: a bare-shell loss never exits, so the watchdog fires and reports
+ * it. A `deliveryVerified === false` on a launch that then runs normally is a
+ * timing artifact of the 5 s delivery-check window, so it stays OUT of the
+ * summary (it is recorded in the delivery log instead). Never re-submits.
+ */
+export function buildLaunchNote(reason: string, deliveryVerified: boolean | undefined): string {
+  if (reason !== "timeout") return "";
+  const delivery =
+    deliveryVerified === false
+      ? " The post-submit delivery check also never saw the launch script."
+      : "";
+  return (
+    `LAUNCH NOT CONFIRMED: the pane never showed the launch script and the watchdog stopped the wait.${delivery} ` +
+    `Not re-submitted (never blind-resubmit) — inspect the pane, then retry. `
+  );
+}
+
+/**
+ * Soft debug record for a launch the delivery check could not confirm.
+ * Deliberately NOT parent-facing (a slow-starting pane can trip the check on a
+ * launch that succeeds) and never throws — the terminal watchdog timeout is the
+ * only parent-visible signal. Appends one line to `<artifactDir>/delivery-verification.log`.
+ */
+function recordDeliveryMiss(artifactDir: string, surface: string, scriptName: string): void {
+  try {
+    appendFileSync(
+      join(artifactDir, "delivery-verification.log"),
+      `${new Date().toISOString()} surface=${surface} script=${scriptName} verdict=not-confirmed\n`,
+      "utf8",
+    );
+  } catch {}
+}
+
+/**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
@@ -1196,6 +1247,11 @@ async function launchSubagent(
     ].join("\n"),
   });
 
+  // F2/H1 hardening: `pane run` is fire-and-forget, so confirm the typed line
+  // landed. A miss is reported by watchSubagent and is NEVER re-sent blindly.
+  const delivery = await verifyCommandDelivered(surface, launchScriptName);
+  if (!delivery.delivered) recordDeliveryMiss(artifactDir, surface, launchScriptName);
+
   const running: RunningSubagent = {
     id,
     name: params.name,
@@ -1206,6 +1262,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    deliveryVerified: delivery.delivered,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1254,6 +1311,7 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      maxElapsedMs: getWatchdogMs(),
       onTick() {
         observeRunningSubagent(running);
       },
@@ -1299,6 +1357,7 @@ async function watchSubagent(
 
     // Pi subagent result extraction
     let summary: string;
+    const launchNote = buildLaunchNote(result.reason, running.deliveryVerified);
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
       summary =
@@ -1315,6 +1374,8 @@ async function watchSubagent(
           ? `Sub-agent exited with code ${result.exitCode}`
           : "Sub-agent exited without output";
     }
+
+    summary = `${launchNote}${summary}`;
 
     closeSurface(surface);
     runningSubagents.delete(running.id);
