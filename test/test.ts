@@ -31,6 +31,8 @@ import {
   selectZellijPlacement,
   selectZellijStackPlacement,
   getMuxBackend,
+  pollForExit,
+  verifyCommandDelivered,
 } from "../pi-extension/subagents/cmux.ts";
 import {
   advanceStatusState,
@@ -1307,6 +1309,91 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
     });
+  });
+});
+
+describe("index.ts buildLaunchNote", () => {
+  it("reports a timeout even when delivery was never confirmed", () => {
+    const note = subagentsModule.buildLaunchNote("timeout", false);
+    assert.match(note, /LAUNCH NOT CONFIRMED/);
+    assert.match(note, /watchdog stopped the wait/);
+    assert.match(note, /delivery check also never saw the launch script/);
+    assert.match(note, /never blind-resubmit/);
+  });
+
+  it("reports a timeout without the delivery clause when delivery was confirmed", () => {
+    const note = subagentsModule.buildLaunchNote("timeout", true);
+    assert.match(note, /LAUNCH NOT CONFIRMED/);
+    assert.doesNotMatch(note, /delivery check also never saw/);
+  });
+
+  it("stays silent for an unconfirmed delivery that then exits normally", () => {
+    assert.equal(subagentsModule.buildLaunchNote("done", false), "");
+    assert.equal(subagentsModule.buildLaunchNote("sentinel", false), "");
+    assert.equal(subagentsModule.buildLaunchNote("error", false), "");
+  });
+});
+
+describe("cmux.ts verifyCommandDelivered", () => {
+  it("reports delivered when the launch script shows up late", async () => {
+    let calls = 0;
+    const read = () => {
+      calls += 1;
+      return calls >= 3 ? "bash subagent-scripts/foo.sh" : "$ ";
+    };
+    const result = await verifyCommandDelivered("pane-1", "foo.sh", {
+      attempts: 5,
+      intervalMs: 1,
+      read,
+    });
+    assert.equal(result.delivered, true);
+    assert.equal(calls, 3);
+  });
+
+  it("reports a miss when the pane stays at a bare prompt", async () => {
+    const result = await verifyCommandDelivered("pane-1", "foo.sh", {
+      attempts: 3,
+      intervalMs: 1,
+      read: () => "$ ",
+    });
+    assert.equal(result.delivered, false);
+    assert.equal(result.screen, "$ ");
+  });
+
+  it("treats a failing screen read as a miss instead of throwing", async () => {
+    const result = await verifyCommandDelivered("pane-1", "foo.sh", {
+      attempts: 2,
+      intervalMs: 1,
+      read: () => {
+        throw new Error("pane gone");
+      },
+    });
+    assert.equal(result.delivered, false);
+  });
+});
+
+describe("cmux.ts pollForExit watchdog", () => {
+  it("ends the wait with a terminal timeout instead of looping forever", async () => {
+    const started = Date.now();
+    const result = await pollForExit("no-such-pane", new AbortController().signal, {
+      interval: 20,
+      maxElapsedMs: 120,
+      read: () => "",
+    });
+    assert.equal(result.reason, "timeout");
+    assert.equal(result.exitCode, 124);
+    assert.match(result.errorMessage ?? "", /no exit after/);
+    assert.ok(Date.now() - started < 5000, "the watchdog must stop the loop");
+  });
+
+  it("still honours a real exit before the ceiling", async () => {
+    const result = await pollForExit("no-such-pane", new AbortController().signal, {
+      interval: 20,
+      maxElapsedMs: 5000,
+      read: () => "__SUBAGENT_DONE_0__",
+    });
+    assert.equal(result.reason, "sentinel");
+    assert.equal(result.exitCode, 0);
   });
 });
 
