@@ -68,6 +68,20 @@ import {
   parseHerdrJson,
   extractHerdrPaneId,
   extractHerdrRootPaneId,
+  getHerdrPaneLayout,
+  layoutHerdrColumns,
+  parseHerdrLayout,
+  planHerdrScoutPlacement,
+  planHerdrGeometrySteps,
+  planHerdrWidthSteps,
+  planHerdrColumnSteps,
+  applyHerdrLayoutPlan,
+  buildHerdrPaneLayoutArgs,
+  buildHerdrResizeArgs,
+  getHerdrMinPaneHeight,
+  getHerdrMinColumnWidth,
+  HERDR_DEFAULT_MIN_PANE_HEIGHT,
+  HERDR_DEFAULT_MIN_COLUMN_WIDTH,
   isHerdrAvailable,
   isHerdrErrorCode,
   closeHerdrSurface,
@@ -2751,6 +2765,330 @@ describe("herdr.ts", () => {
         "w1",
         "Scout",
       ]);
+    });
+  });
+
+  describe("two-column layout planning", () => {
+    // Fixtures use the geometries measured live against herdr 0.9.3:
+    // `pane split <pane> --ratio F` divides that pane's own rect (the original
+    // keeps F) and `pane resize --amount A` moves the adjacent boundary by
+    // A x the owning split's extent.
+    const rect = (x: number, y: number, width: number, height: number) => ({ x, y, width, height });
+    const pane = (
+      paneId: string,
+      x: number,
+      y: number,
+      width: number,
+      height: number,
+    ) => ({ paneId, rect: rect(x, y, width, height) });
+    const split = (
+      id: string,
+      direction: string,
+      ratio: number,
+      x: number,
+      y: number,
+      width: number,
+      height: number,
+    ) => ({ id, direction, ratio, rect: rect(x, y, width, height) });
+    const snapshot = (over: Record<string, unknown> = {}) => ({
+      area: rect(0, 0, 187, 45),
+      panes: [] as ReturnType<typeof pane>[],
+      splits: [] as ReturnType<typeof split>[],
+      zoomed: false,
+      ...over,
+    });
+    /** Right-hand column panes laid out top -> bottom with the given heights. */
+    const columnPanes = (heights: number[], x = 94, width = 93) => {
+      let y = 0;
+      return heights.map((height, index) => {
+        const placed = pane(`w1:c${index}`, x, y, width, height);
+        y += height;
+        return placed;
+      });
+    };
+    const withParent = (panes: ReturnType<typeof pane>[]) => [pane("w1:p1", 0, 0, 94, 45), ...panes];
+
+    it("splits the parent right when there is no usable geometry", () => {
+      for (const geometry of [
+        null,
+        snapshot({ zoomed: true, panes: [pane("w1:p1", 0, 0, 187, 45)] }),
+        snapshot({ panes: [pane("w9:p9", 0, 0, 187, 45)] }),
+      ]) {
+        const plan = planHerdrScoutPlacement(geometry, { parentPaneId: "w1:p1" });
+        assert.equal(plan.mode, "stack");
+        assert.equal(plan.reason, "no-geometry");
+        assert.equal(plan.splitPane, "w1:p1");
+        assert.equal(plan.splitDirection, "right");
+        assert.equal(plan.splitRatio, 0.5);
+        assert.deepEqual(plan.resizes, []);
+      }
+    });
+
+    it("stacks the first scout by splitting the parent right 50/50", () => {
+      const geometry = snapshot({ panes: [pane("w1:p1", 0, 0, 187, 45)] });
+      const plan = planHerdrScoutPlacement(geometry, { parentPaneId: "w1:p1" });
+      assert.equal(plan.mode, "stack");
+      assert.equal(plan.reason, "first-column");
+      assert.equal(plan.splitPane, "w1:p1");
+      assert.equal(plan.splitDirection, "right");
+      assert.equal(plan.splitRatio, 0.5);
+    });
+
+    it("stacks later scouts by splitting the bottom pane of the column down", () => {
+      const geometry = snapshot({
+        panes: withParent(columnPanes([23, 22])),
+        splits: [split("s1", "down", 0.5, 94, 0, 93, 45), split("s2", "right", 0.5, 0, 0, 187, 45)],
+      });
+      const plan = planHerdrScoutPlacement(geometry, { parentPaneId: "w1:p1" });
+      assert.equal(plan.mode, "stack");
+      assert.equal(plan.reason, "stack");
+      assert.equal(plan.splitPane, "w1:c1", "the anchor is the bottom pane of that column");
+      assert.equal(plan.splitDirection, "down");
+      assert.equal(plan.splitRatio, 0.5);
+      // The existing spine split becomes 1/3 so all three panes end up equal.
+      assert.deepEqual(plan.resizes, [{ pane: "w1:c1", direction: "up", amount: 0.1667 }]);
+
+      // A one-pane column is stacked by splitting its only pane.
+      const single = snapshot({ panes: withParent(columnPanes([45])) });
+      const fromSingle = planHerdrScoutPlacement(single, { parentPaneId: "w1:p1" });
+      assert.equal(fromSingle.splitPane, "w1:c0");
+      assert.equal(fromSingle.splitDirection, "down");
+    });
+
+    it("starts a new column when the column is full, and a new tab when too narrow", () => {
+      const full = snapshot({ panes: withParent(columnPanes([9, 9, 9, 9, 9])) });
+      const plan = planHerdrScoutPlacement(full, { parentPaneId: "w1:p1" });
+      // 45 / 6 = 7 rows per pane -> below the 8-row guard.
+      assert.equal(plan.mode, "new-column");
+      assert.equal(plan.reason, "new-column");
+      assert.equal(plan.splitPane, "w1:p1");
+      assert.equal(plan.splitDirection, "right");
+      assert.equal(plan.splitRatio, 0.5);
+      assert.deepEqual(plan.resizes, []);
+
+      const narrow = planHerdrScoutPlacement(full, { parentPaneId: "w1:p1", minColumnWidth: 50 });
+      assert.equal(narrow.mode, "new-tab");
+      assert.equal(narrow.reason, "width-guard");
+      assert.equal(narrow.splitPane, null);
+      // A new-tab plan touches herdr not at all.
+      assert.equal(applyHerdrLayoutPlan(narrow, { parentPaneId: "w1:p1" }), null);
+    });
+
+    it("honours the guards as arguments, so sizing is testable", () => {
+      const two = snapshot({ panes: withParent(columnPanes([23, 22])) });
+      assert.equal(planHerdrScoutPlacement(two, { parentPaneId: "w1:p1" }).mode, "stack");
+      assert.equal(
+        planHerdrScoutPlacement(two, { parentPaneId: "w1:p1", minPaneHeight: 20 }).mode,
+        "new-column",
+      );
+    });
+
+    it("reads the guards from PI_SUBAGENT_* env vars, ignoring junk", () => {
+      assert.equal(HERDR_DEFAULT_MIN_PANE_HEIGHT, 8);
+      assert.equal(HERDR_DEFAULT_MIN_COLUMN_WIDTH, 24);
+      assert.equal(getHerdrMinPaneHeight({} as NodeJS.ProcessEnv), 8);
+      assert.equal(getHerdrMinPaneHeight({ PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT: "12" } as any), 12);
+      assert.equal(getHerdrMinPaneHeight({ PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT: "0" } as any), 8);
+      assert.equal(getHerdrMinPaneHeight({ PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT: "x" } as any), 8);
+      assert.equal(getHerdrMinColumnWidth({} as NodeJS.ProcessEnv), 24);
+      assert.equal(getHerdrMinColumnWidth({ PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH: "30" } as any), 30);
+    });
+
+    it("parses `pane layout` output and degrades on junk", () => {
+      const live = JSON.stringify({
+        type: "ok",
+        result: {
+          layout: {
+            area: { x: 0, y: 0, width: 187, height: 45 },
+            focused_pane_id: "w1:p1",
+            panes: [
+              { pane_id: "w1:p1", rect: { x: 0, y: 0, width: 94, height: 45 } },
+              { pane_id: "w1:p2", rect: { x: 94, y: 0, width: 93, height: 45 } },
+              { pane_id: "w1:p3", rect: { x: 94, y: 23, width: 93, height: 22 } },
+              { pane_id: "w1:p4", rect: { x: 94, y: 23 } },
+            ],
+            splits: [
+              { id: "s1", direction: "right", ratio: 0.5, rect: { x: 0, y: 0, width: 187, height: 45 } },
+              { id: "s2", direction: "bogus", ratio: 0.5 },
+            ],
+            tab_id: "w1:t1",
+            workspace_id: "w1",
+            zoomed: false,
+          },
+        },
+      });
+      const parsed = parseHerdrLayout(live)!;
+      assert.deepEqual(parsed.area, { x: 0, y: 0, width: 187, height: 45 });
+      assert.equal(parsed.tabId, "w1:t1");
+      assert.equal(parsed.zoomed, false);
+      // Entries with a broken rect are dropped, the snapshot survives.
+      assert.deepEqual(parsed.panes.map((entry) => entry.paneId), ["w1:p1", "w1:p2", "w1:p3"]);
+      assert.deepEqual(parsed.splits.map((entry) => entry.id), ["s1"]);
+
+      assert.equal(parseHerdrLayout("not json"), null);
+      assert.equal(parseHerdrLayout("{}"), null);
+      assert.equal(parseHerdrLayout(JSON.stringify({ result: {} })), null);
+      assert.equal(parseHerdrLayout(JSON.stringify({ result: { layout: { panes: [] } } })), null);
+    });
+
+    it("groups the right-hand panes into columns, left to right", () => {
+      const geometry = snapshot({
+        panes: [
+          pane("w1:p1", 0, 0, 94, 45),
+          pane("w1:c0", 94, 0, 31, 45),
+          pane("w1:c1", 125, 0, 31, 45),
+          ...columnPanes([9, 9, 9, 9, 9], 156, 31),
+        ],
+      });
+      const columns = layoutHerdrColumns(geometry, "w1:p1");
+      assert.deepEqual(columns.map((column) => [column.x, column.width, column.panes.length]), [
+        [94, 31, 1],
+        [125, 31, 1],
+        [156, 31, 5],
+      ]);
+      // Panes left of (or under) the parent are never columns.
+      assert.deepEqual(layoutHerdrColumns(geometry, "w1:missing"), []);
+    });
+
+    // The widths/parent share this fixture already satisfies: 187 = 94 + 31 + 31 + 31.
+    const threeColumns = () =>
+      snapshot({
+        panes: [
+          pane("w1:p1", 0, 0, 94, 45),
+          pane("w1:c0", 94, 0, 31, 45),
+          pane("w1:c1", 125, 0, 31, 45),
+          ...columnPanes([9, 9, 9, 9, 9], 156, 31),
+        ],
+        splits: [
+          split("spine1", "right", 0.8333, 0, 0, 187, 45),
+          split("spine2", "right", 0.8, 0, 0, 156, 45),
+          split("spine3", "right", 0.75, 0, 0, 125, 45),
+          split("v1", "down", 0.2, 156, 0, 31, 45),
+          split("v2", "down", 0.25, 156, 9, 31, 36),
+          split("v3", "down", 1 / 3, 156, 18, 31, 27),
+          split("v4", "down", 0.5, 156, 27, 31, 18),
+        ],
+      });
+
+    it("reports no steps for a layout that is already correct", () => {
+      assert.deepEqual(
+        planHerdrGeometrySteps(threeColumns(), { parentPaneId: "w1:p1", scope: "layout" }),
+        [],
+      );
+      assert.deepEqual(
+        planHerdrGeometrySteps(threeColumns(), { parentPaneId: "w1:p1", scope: "column" }),
+        [],
+      );
+      assert.deepEqual(
+        planHerdrGeometrySteps(null, { parentPaneId: "w1:p1", scope: "layout" }),
+        [],
+      );
+    });
+
+    it("repairs a parent that lost width instead of squeezing the new column", () => {
+      // Regression: pining the parent against a stale split rect used to leave
+      // the parent short and the new column a ~9-column strip.
+      const damaged = { ...threeColumns() };
+      damaged.panes = [
+        pane("w1:p1", 0, 0, 84, 45),
+        pane("w1:c0", 84, 0, 41, 45),
+        pane("w1:c1", 125, 0, 31, 45),
+        ...columnPanes([9, 9, 9, 9, 9], 156, 31),
+      ];
+      damaged.splits = [
+        split("spine1", "right", 156 / 187, 0, 0, 187, 45),
+        split("spine2", "right", 125 / 156, 0, 0, 156, 45),
+        split("spine3", "right", 84 / 125, 0, 0, 125, 45),
+        split("v1", "down", 0.2, 156, 0, 31, 45),
+        split("v2", "down", 0.25, 156, 9, 31, 36),
+        split("v3", "down", 1 / 3, 156, 18, 31, 27),
+        split("v4", "down", 0.5, 156, 27, 31, 18),
+      ];
+      const steps = planHerdrGeometrySteps(damaged, {
+        parentPaneId: "w1:p1",
+        scope: "layout",
+      });
+      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "right", amount: 0.078 }]);
+      // The width pass is deliberately excluded from a column-only pass.
+      assert.deepEqual(
+        planHerdrGeometrySteps(damaged, { parentPaneId: "w1:p1", scope: "column" }),
+        [],
+      );
+    });
+
+    it("moves a boundary back with the opposite direction and pane", () => {
+      const lopsided = snapshot({
+        panes: withParent(columnPanes([30, 15])),
+        splits: [split("s1", "down", 30 / 45, 94, 0, 93, 45), split("s2", "right", 0.5, 0, 0, 187, 45)],
+      });
+      const steps = planHerdrGeometrySteps(lopsided, {
+        parentPaneId: "w1:p1",
+        scope: "column",
+      });
+      assert.equal(steps.length, 1);
+      assert.equal(steps[0].pane, "w1:c1", "a shrinking boundary is pulled by the pane below");
+      assert.equal(steps[0].direction, "up");
+      assert.ok(Math.abs(steps[0].amount - (30 / 45 - 0.5)) < 1e-3);
+      // The amount is a fraction of that split's extent: 7.5 of 45 rows.
+      assert.ok(Math.abs(steps[0].amount * 45 - 7.5) < 0.05);
+      assert.deepEqual(planHerdrWidthSteps(lopsided, layoutHerdrColumns(lopsided, "w1:p1"), "w1:p1"), []);
+    });
+
+    it("builds the layout/resize argv and keeps the split contract", () => {
+      assert.deepEqual(buildHerdrPaneLayoutArgs("w1:p2"), ["pane", "layout", "--pane", "w1:p2"]);
+      assert.deepEqual(buildHerdrResizeArgs("w1:p2", "down", 0.25), [
+        "pane",
+        "resize",
+        "--pane",
+        "w1:p2",
+        "--direction",
+        "down",
+        "--amount",
+        "0.25",
+      ]);
+      // A ratio is optional: the pre-layout argv stays byte-identical.
+      assert.deepEqual(testApi.buildHerdrSplitArgs("w1:p1", "right", { ratio: 0.5 }), [
+        "pane",
+        "split",
+        "w1:p1",
+        "--direction",
+        "right",
+        "--ratio",
+        "0.5",
+        "--no-focus",
+      ]);
+      assert.deepEqual(testApi.buildHerdrSplitArgs("w1:p1", "down"), [
+        "pane",
+        "split",
+        "w1:p1",
+        "--direction",
+        "down",
+        "--no-focus",
+      ]);
+    });
+
+    it("never emits a resize for a geometry it does not own", () => {
+      // Two spine splits for three columns: not a shape we manage.
+      const mismatched = threeColumns();
+      mismatched.splits = mismatched.splits.filter((entry) => entry.id !== "spine3");
+      assert.deepEqual(
+        planHerdrWidthSteps(
+          mismatched,
+          layoutHerdrColumns(mismatched, "w1:p1"),
+          "w1:p1",
+        ),
+        [],
+      );
+      // Columns too narrow to grow another one are left untouched.
+      assert.deepEqual(
+        planHerdrWidthSteps(
+          threeColumns(),
+          layoutHerdrColumns(threeColumns(), "w1:p1"),
+          "w1:p1",
+          50,
+        ),
+        [],
+      );
     });
   });
 
