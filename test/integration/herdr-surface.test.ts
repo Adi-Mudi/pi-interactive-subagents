@@ -42,6 +42,8 @@ import {
   isHerdrAgent,
   waitForHerdrAgentSettle,
   getHerdrParentPaneId,
+  getHerdrPaneLayout,
+  layoutHerdrColumns,
 } from "../../pi-extension/subagents/herdr.ts";
 
 const herdrReady = isHerdrAvailable() && !!getHerdrParentPaneId();
@@ -139,6 +141,109 @@ if (herdrReady) {
       tempDirs.length = 0;
       if (prevMux === undefined) delete process.env.PI_SUBAGENT_MUX;
       else process.env.PI_SUBAGENT_MUX = prevMux;
+    });
+
+    it("keeps the parent at ~50% and stacks scouts in one column", async (t) => {
+      const parent = getHerdrParentPaneId();
+      assert.ok(parent, "expected HERDR_PANE_ID inside a herdr pane");
+
+      // The assertions below describe one whole tab, so they need a pristine
+      // one (fresh CI pane: the parent alone). Stray panes -> skip, never fail.
+      const before = getHerdrPaneLayout(parent!);
+      assert.ok(before, "expected a `pane layout` snapshot");
+      if (before.panes.length !== 1) {
+        t.skip(`expected a pristine tab, found ${before.panes.length} panes`);
+        return;
+      }
+      const halfTab = before.area.width / 2;
+      const focusBefore = focusedPaneId();
+      const prevHeight = process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
+      const prevWidth = process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH;
+      // Pin both guards so the geometry below does not depend on the runner's
+      // tab size (the defaults are unit-tested).
+      process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = "1";
+      process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = "1";
+      try {
+        const stacked: string[] = [];
+        for (let index = 0; index < 4; index += 1) {
+          const surface = createSurface(`p4-layout-${uniqueId()}`);
+          created.push(surface);
+          stacked.push(surface);
+        }
+
+        const geometry = getHerdrPaneLayout(parent!)!;
+        const parentRect = geometry.panes.find((entry) => entry.paneId === parent)!.rect;
+        assert.ok(
+          Math.abs(parentRect.width - halfTab) <= 2,
+          `parent must keep ~50% of the tab, got ${parentRect.width} of ${geometry.area.width}`,
+        );
+        assert.equal(focusedPaneId(), focusBefore, "spawning must not steal focus");
+
+        const columns = layoutHerdrColumns(geometry, parent!);
+        assert.equal(columns.length, 1, "four scouts must share a single column");
+        assert.deepEqual(
+          columns[0].panes.map((entry) => entry.paneId).sort(),
+          [...stacked].sort(),
+          "the column must hold exactly the spawned panes",
+        );
+        const heights = columns[0].panes.map((entry) => entry.rect.height);
+        assert.ok(
+          Math.max(...heights) - Math.min(...heights) <= 2,
+          `stacked panes must be near-equal, got ${heights.join(",")}`,
+        );
+        assert.ok(
+          Math.abs(columns[0].width - halfTab) <= 2,
+          `the column must hold the other ~50%, got ${columns[0].width} of ${geometry.area.width}`,
+        );
+
+        // A column that can no longer hold a legible pane opens a second one,
+        // and the parent still keeps its ~50% (the outer-boundary-first rule).
+        process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = "999";
+        const newColumn = createSurface(`p4-col2-${uniqueId()}`);
+        created.push(newColumn);
+        const widened = getHerdrPaneLayout(parent!)!;
+        const wideParent = widened.panes.find((entry) => entry.paneId === parent)!.rect;
+        assert.ok(
+          Math.abs(wideParent.width - halfTab) <= 2,
+          `a new column must not squeeze the parent, got ${wideParent.width} of ${widened.area.width}`,
+        );
+        const wideColumns = layoutHerdrColumns(widened, parent!);
+        assert.equal(wideColumns.length, 2, "the fifth scout must open a second column");
+        assert.ok(
+          wideColumns.some((column) =>
+            column.panes.some((entry) => entry.paneId === newColumn),
+          ),
+          "the new column must hold the new pane",
+        );
+        const widths = wideColumns.map((column) => column.width);
+        assert.ok(
+          Math.max(...widths) - Math.min(...widths) <= 2,
+          `columns must be near-equal, got ${widths.join(",")}`,
+        );
+
+        // A column too narrow to be usable falls back to a fresh tab and must
+        // leave the parent's tab exactly as it was.
+        process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = "9999";
+        const panesBeforeFallback = widened.panes.length;
+        const tabPane = createSurface(`p4-tab-${uniqueId()}`);
+        assert.equal(paneExists(tabPane), true, "the fallback pane must exist");
+        assert.equal(
+          getHerdrPaneLayout(parent!)!.panes.length,
+          panesBeforeFallback,
+          "a width-guard fallback must not touch the parent's tab",
+        );
+        const tabId = getHerdrPaneLayout(tabPane)?.tabId;
+        assert.ok(tabId && tabId !== before.tabId, "the fallback pane must live in a new tab");
+        // Close only the tab we just created (never the parent's).
+        herdr(["tab", "close", tabId!]);
+        await sleep(500);
+        assert.equal(paneExists(tabPane), false, "the fallback tab must be cleaned up");
+      } finally {
+        if (prevHeight === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT;
+        else process.env.PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT = prevHeight;
+        if (prevWidth === undefined) delete process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH;
+        else process.env.PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH = prevWidth;
+      }
     });
 
     it("splits a real pane with --no-focus and does not steal focus", async () => {

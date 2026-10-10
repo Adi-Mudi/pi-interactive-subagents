@@ -86,6 +86,128 @@ export function herdrSplitDirection(direction: HerdrSplitDirection): "right" | "
   return direction === "left" || direction === "right" ? "right" : "down";
 }
 
+// ── Layout geometry (two-column stacked placement) ──────────────────────────
+
+/**
+ * herdr stacks panes as nested rect splits, so splitting the parent RIGHT again
+ * for every scout squeezes every earlier pane into a narrow strip. The policy
+ * below keeps the parent at ~50% of the tab and grows ONE right-hand column:
+ * the first scout splits the parent right, every later scout splits the bottom
+ * pane of that column down, and a short resize pass re-equalises the column.
+ *
+ * Measured against herdr 0.9.3 (the numbers these helpers rely on):
+ *   - `pane split <pane> --direction right|down --ratio F` divides that pane's
+ *     own rect: the original keeps F, the new pane gets 1-F.
+ *   - `pane resize --pane <pane> --direction up|down|left|right --amount A`
+ *     moves the boundary adjacent to that pane in that direction by
+ *     A x the owning split's extent, so A maps 1:1 onto that split's ratio.
+ *   - `pane layout --pane <pane>` reports every rect and split ratio, which is
+ *     all the arithmetic needs.
+ *
+ * See .IDE_Plans/herdr-two-column-layout-fix_plan_20261010_2003_v1.0.md §Design.
+ */
+
+/** Below this many rows a fresh stacked pane is unreadable -> new column. */
+export const HERDR_DEFAULT_MIN_PANE_HEIGHT = 8;
+/** Below this many columns a fresh column is unusable -> new tab fallback. */
+export const HERDR_DEFAULT_MIN_COLUMN_WIDTH = 24;
+/** Share of the tab width the calling pi pane keeps. */
+export const HERDR_PARENT_WIDTH_SHARE = 0.5;
+/** Resize passes per spawn; a second pass only fixes +/-1 rounding drift. */
+export const HERDR_LAYOUT_MAX_PASSES = 2;
+
+/** Ignore resize deltas below this many rows/columns (rounding noise). */
+const HERDR_MIN_RESIZE_EXTENT = 1;
+
+export interface HerdrPaneRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface HerdrPanePlacement {
+  paneId: string;
+  rect: HerdrPaneRect;
+}
+
+export interface HerdrSplitInfo {
+  id: string;
+  direction: string;
+  ratio: number;
+  rect: HerdrPaneRect;
+}
+
+export interface HerdrLayoutSnapshot {
+  area: HerdrPaneRect;
+  panes: HerdrPanePlacement[];
+  splits: HerdrSplitInfo[];
+  zoomed: boolean;
+  focusedPaneId?: string;
+  tabId?: string;
+}
+
+/** Panes sharing an x offset inside the right-hand region, top -> bottom. */
+export interface HerdrColumn {
+  x: number;
+  width: number;
+  panes: HerdrPanePlacement[];
+}
+
+export type HerdrResizeDirection = "left" | "right" | "up" | "down";
+
+export interface HerdrResizeStep {
+  pane: string;
+  direction: HerdrResizeDirection;
+  amount: number;
+}
+
+/** `stack` splits a column pane down; `new-column` splits the parent right. */
+export type HerdrScoutPlacementMode = "stack" | "new-column" | "new-tab";
+
+export interface HerdrScoutPlacement {
+  mode: HerdrScoutPlacementMode;
+  splitPane: string | null;
+  splitDirection: "right" | "down";
+  splitRatio: number;
+  /** Resize steps known before the split; the executor recomputes after it. */
+  resizes: HerdrResizeStep[];
+  reason: string;
+}
+
+export interface HerdrPlacementOptions {
+  parentPaneId: string;
+  minPaneHeight?: number;
+  minColumnWidth?: number;
+}
+
+/** `column` only equalises the right-most column; `layout` also pins widths. */
+export type HerdrGeometryScope = "column" | "layout";
+
+export interface HerdrGeometryOptions {
+  parentPaneId: string;
+  scope: HerdrGeometryScope;
+  minPaneHeight?: number;
+  minColumnWidth?: number;
+}
+
+function readPositiveIntEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+/** Min rows per stacked pane; `PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT` overrides. */
+export function getHerdrMinPaneHeight(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntEnv(env, "PI_SUBAGENT_HERDR_MIN_PANE_HEIGHT", HERDR_DEFAULT_MIN_PANE_HEIGHT);
+}
+
+/** Min columns per column; `PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH` overrides. */
+export function getHerdrMinColumnWidth(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntEnv(env, "PI_SUBAGENT_HERDR_MIN_COLUMN_WIDTH", HERDR_DEFAULT_MIN_COLUMN_WIDTH);
+}
+
 // ── Command availability ────────────────────────────────────────────────────
 
 const commandAvailability = new Map<string, boolean>();
@@ -299,19 +421,99 @@ export function extractHerdrRootPaneId(output: string, context: string): string 
   return paneId;
 }
 
+// ── Layout geometry: snapshot parsing ──────────────────────────────────────
+
+function parseHerdrRect(value: unknown): HerdrPaneRect | null {
+  const rect = value as Partial<HerdrPaneRect> | null | undefined;
+  if (!rect || typeof rect !== "object") return null;
+  const { x, y, width, height } = rect;
+  const numbers = [x, y, width, height];
+  if (!numbers.every((entry) => typeof entry === "number" && Number.isFinite(entry))) return null;
+  return { x: x as number, y: y as number, width: width as number, height: height as number };
+}
+
+/**
+ * `pane layout --pane <id>` JSON -> snapshot. Pure; null when the payload is
+ * not a layout (a missing key degrades the layout pass, never the spawn).
+ */
+export function parseHerdrLayout(output: string): HerdrLayoutSnapshot | null {
+  const parsed = parseHerdrJson(output) as { result?: { layout?: unknown } } | null;
+  const layout = parsed?.result?.layout as Record<string, unknown> | undefined;
+  if (!layout || typeof layout !== "object") return null;
+  const area = parseHerdrRect(layout.area);
+  if (!area) return null;
+
+  const panes: HerdrPanePlacement[] = [];
+  for (const entry of Array.isArray(layout.panes) ? layout.panes : []) {
+    const paneId = (entry as { pane_id?: unknown })?.pane_id;
+    const rect = parseHerdrRect((entry as { rect?: unknown })?.rect);
+    if (typeof paneId === "string" && paneId && rect) panes.push({ paneId, rect });
+  }
+
+  const splits: HerdrSplitInfo[] = [];
+  for (const entry of Array.isArray(layout.splits) ? layout.splits : []) {
+    const id = (entry as { id?: unknown })?.id;
+    const direction = (entry as { direction?: unknown })?.direction;
+    const ratio = (entry as { ratio?: unknown })?.ratio;
+    const rect = parseHerdrRect((entry as { rect?: unknown })?.rect);
+    if (
+      typeof id === "string" &&
+      typeof direction === "string" &&
+      typeof ratio === "number" &&
+      rect
+    ) {
+      splits.push({ id, direction, ratio, rect });
+    }
+  }
+
+  return {
+    area,
+    panes,
+    splits,
+    zoomed: layout.zoomed === true,
+    focusedPaneId: typeof layout.focused_pane_id === "string" ? layout.focused_pane_id : undefined,
+    tabId: typeof layout.tab_id === "string" ? layout.tab_id : undefined,
+  };
+}
+
+/** Live geometry for a pane; null on any failure (layout work is cosmetic). */
+export function getHerdrPaneLayout(pane: string): HerdrLayoutSnapshot | null {
+  try {
+    return parseHerdrLayout(herdrExec(buildHerdrPaneLayoutArgs(pane)));
+  } catch {
+    return null;
+  }
+}
+
 // ── Argv builders (pure — the unit-testable contract) ───────────────────────
 
-/** `pane split [<pane>] --direction right|down --no-focus [--cwd <path>]` */
+/** `pane split [<pane>] --direction right|down [--ratio <f>] --no-focus [--cwd <p>]` */
 export function buildHerdrSplitArgs(
   pane: string | undefined,
   direction: HerdrSplitDirection,
-  options?: { cwd?: string },
+  options?: { cwd?: string; ratio?: number },
 ): string[] {
   const args = ["pane", "split"];
   if (pane) args.push(pane);
-  args.push("--direction", herdrSplitDirection(direction), "--no-focus");
+  args.push("--direction", herdrSplitDirection(direction));
+  if (typeof options?.ratio === "number") args.push("--ratio", String(options.ratio));
+  args.push("--no-focus");
   if (options?.cwd) args.push("--cwd", options.cwd);
   return args;
+}
+
+/** `pane layout --pane <pane>` — geometry snapshot (rects + split ratios). */
+export function buildHerdrPaneLayoutArgs(pane: string): string[] {
+  return ["pane", "layout", "--pane", pane];
+}
+
+/** `pane resize --pane <pane> --direction <dir> --amount <float>` */
+export function buildHerdrResizeArgs(
+  pane: string,
+  direction: HerdrResizeDirection,
+  amount: number,
+): string[] {
+  return ["pane", "resize", "--pane", pane, "--direction", direction, "--amount", String(amount)];
 }
 
 /** `tab create --label <name> --no-focus [--cwd <path>]` — split fallback. */
@@ -459,6 +661,330 @@ export function getHerdrCurrentPaneInfo(): {
   return null;
 }
 
+// ── Layout geometry: planning (pure) + execution ────────────────────────────
+
+/** Round a boundary amount: herdr takes floats, sub-pixel drift is noise. */
+function roundHerdrAmount(amount: number): number {
+  return Math.round(amount * 10_000) / 10_000;
+}
+
+/** The panes right of `parent`, grouped into columns, left -> right. Pure. */
+export function layoutHerdrColumns(
+  snapshot: HerdrLayoutSnapshot,
+  parentPaneId: string,
+): HerdrColumn[] {
+  const parent = snapshot.panes.find((pane) => pane.paneId === parentPaneId);
+  if (!parent) return [];
+  const parentRight = parent.rect.x + parent.rect.width;
+
+  const groups = new Map<number, HerdrPanePlacement[]>();
+  for (const pane of snapshot.panes) {
+    if (pane.paneId === parentPaneId || pane.rect.x < parentRight) continue;
+    const group = groups.get(pane.rect.x);
+    if (group) group.push(pane);
+    else groups.set(pane.rect.x, [pane]);
+  }
+
+  return [...groups.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([x, panes]) => {
+      const ordered = [...panes].sort((a, b) => a.rect.y - b.rect.y);
+      return { x, width: ordered[0]?.rect.width ?? 0, panes: ordered };
+    });
+}
+
+function herdrColumnHeight(column: HerdrColumn): number {
+  return column.panes.reduce((total, pane) => total + pane.rect.height, 0);
+}
+
+/** A split's own boundary on its axis (`down` -> y, `right` -> x). Pure. */
+function herdrSplitBoundary(split: HerdrSplitInfo): number {
+  return split.direction === "down"
+    ? split.rect.y + split.ratio * split.rect.height
+    : split.rect.x + split.ratio * split.rect.width;
+}
+
+/**
+ * The split owning `boundary` — the one whose first child ends there. Matching
+ * is geometric (rect ratios are exact, pane rects are floored, hence +/-1);
+ * ties prefer the outer split. Pure.
+ */
+function findHerdrOwningSplit(
+  snapshot: HerdrLayoutSnapshot,
+  direction: "down" | "right",
+  boundary: number,
+  where: (split: HerdrSplitInfo) => boolean,
+): HerdrSplitInfo | null {
+  const candidates = snapshot.splits.filter(
+    (split) =>
+      split.direction === direction &&
+      where(split) &&
+      Math.abs(herdrSplitBoundary(split) - boundary) <= 1,
+  );
+  candidates.sort((a, b) =>
+    direction === "down" ? b.rect.height - a.rect.height : b.rect.width - a.rect.width,
+  );
+  return candidates[0] ?? null;
+}
+
+/** Tallest pane whose right edge sits on `boundary` (the lane's left group). */
+function herdrPaneEndingAt(snapshot: HerdrLayoutSnapshot, boundary: number): string | null {
+  const candidates = snapshot.panes.filter(
+    (pane) => Math.abs(pane.rect.x + pane.rect.width - boundary) <= 1,
+  );
+  candidates.sort((a, b) => b.rect.height - a.rect.height);
+  return candidates[0]?.paneId ?? null;
+}
+
+/** Tallest pane whose left edge sits on `boundary` (the lane's right group). */
+function herdrPaneStartingAt(snapshot: HerdrLayoutSnapshot, boundary: number): string | null {
+  const candidates = snapshot.panes.filter((pane) => Math.abs(pane.rect.x - boundary) <= 1);
+  candidates.sort((a, b) => b.rect.height - a.rect.height);
+  return candidates[0]?.paneId ?? null;
+}
+
+/**
+ * Steps that make `column` hold `paneCount` equal-height panes. The k-th spine
+ * split (top -> bottom) targets 1/(paneCount-k+1) of its own rect, so a fresh
+ * `--ratio 0.5` split is already correct and only earlier splits move. Pure.
+ */
+export function planHerdrColumnSteps(
+  snapshot: HerdrLayoutSnapshot,
+  column: HerdrColumn,
+  paneCount: number,
+): HerdrResizeStep[] {
+  const steps: HerdrResizeStep[] = [];
+  for (let index = 1; index <= paneCount - 1; index += 1) {
+    const paneAbove = column.panes[index - 1];
+    const paneBelow = column.panes[index];
+    if (!paneAbove || !paneBelow) continue; // that split does not exist yet
+    const split = findHerdrOwningSplit(
+      snapshot,
+      "down",
+      paneBelow.rect.y,
+      (candidate) => candidate.rect.x === column.x,
+    );
+    if (!split) continue;
+    const delta = 1 / (paneCount - index + 1) - split.ratio;
+    if (Math.abs(delta) * split.rect.height < HERDR_MIN_RESIZE_EXTENT) continue;
+    steps.push({
+      pane: delta > 0 ? paneAbove.paneId : paneBelow.paneId,
+      direction: delta > 0 ? "down" : "up",
+      amount: roundHerdrAmount(Math.abs(delta)),
+    });
+  }
+  return steps;
+}
+
+/**
+ * Steps that pin the parent at HERDR_PARENT_WIDTH_SHARE of the tab and split
+ * the rest evenly across the right-hand columns.
+ *
+ * Targets use the ratio closed form (2N-k)/(2N-k+1) for the k-th horizontal
+ * spine split counted from the OUTERMOST (k = N is the parent's own right
+ * edge). That form is independent of the split's current rect, so the steps
+ * stay valid while earlier steps move boundaries. Locked decision 4 + F1: the
+ * outermost boundary moves first — growing the parent before the new column
+ * owns its width crushes that column into a strip. Pure.
+ */
+export function planHerdrWidthSteps(
+  snapshot: HerdrLayoutSnapshot,
+  columns: HerdrColumn[],
+  parentPaneId: string,
+  minColumnWidth = HERDR_DEFAULT_MIN_COLUMN_WIDTH,
+): HerdrResizeStep[] {
+  const parent = snapshot.panes.find((pane) => pane.paneId === parentPaneId);
+  if (!parent || columns.length === 0) return [];
+
+  const columnCount = columns.length;
+  const columnWidth = (snapshot.area.width * HERDR_PARENT_WIDTH_SHARE) / columnCount;
+  if (columnWidth < minColumnWidth) return [];
+
+  const spine = snapshot.splits
+    .filter(
+      (split) =>
+        split.direction === "right" &&
+        split.rect.y === snapshot.area.y &&
+        split.rect.height === snapshot.area.height,
+    )
+    .sort((a, b) => b.rect.width - a.rect.width);
+  // Anything but one spine split per column is a shape we do not manage.
+  if (spine.length !== columnCount) return [];
+
+  const steps: HerdrResizeStep[] = [];
+  for (const [rank, split] of spine.entries()) {
+    const depth = rank + 1; // 1 = outermost (biggest rect) ... N = parent edge
+    const target = (2 * columnCount - depth) / (2 * columnCount - depth + 1);
+    const delta = target - split.ratio;
+    if (Math.abs(delta) * split.rect.width < HERDR_MIN_RESIZE_EXTENT) continue;
+    const boundary = herdrSplitBoundary(split);
+    const pane =
+      delta > 0 ? herdrPaneEndingAt(snapshot, boundary) : herdrPaneStartingAt(snapshot, boundary);
+    if (!pane) continue;
+    steps.push({
+      pane,
+      direction: delta > 0 ? "right" : "left",
+      amount: roundHerdrAmount(Math.abs(delta)),
+    });
+  }
+  return steps;
+}
+
+/**
+ * Resize steps that bring the live geometry back to the target layout. Pure and
+ * idempotent: an empty array means "already correct", which is what ends the
+ * executor's pass loop.
+ */
+export function planHerdrGeometrySteps(
+  snapshot: HerdrLayoutSnapshot | null,
+  options: HerdrGeometryOptions,
+): HerdrResizeStep[] {
+  if (!snapshot || snapshot.zoomed) return [];
+  const columns = layoutHerdrColumns(snapshot, options.parentPaneId);
+  if (columns.length === 0) return [];
+
+  const steps: HerdrResizeStep[] = [];
+  if (options.scope === "layout") {
+    steps.push(
+      ...planHerdrWidthSteps(
+        snapshot,
+        columns,
+        options.parentPaneId,
+        options.minColumnWidth ?? HERDR_DEFAULT_MIN_COLUMN_WIDTH,
+      ),
+    );
+  }
+  const touched = options.scope === "column" ? columns.slice(-1) : columns;
+  for (const column of touched) {
+    steps.push(...planHerdrColumnSteps(snapshot, column, column.panes.length));
+  }
+  return steps;
+}
+
+/**
+ * Where the next scout pane goes, plus the geometry work known before the
+ * split. Pure: no herdr calls, no env reads (guards are arguments).
+ *
+ * 1. no usable geometry / no column yet -> split the parent right (50/50).
+ * 2. column can still hold a legible pane -> split its bottom pane down.
+ * 3. column cannot -> new column (parent right), unless that column would be
+ *    narrower than minColumnWidth, in which case the caller uses a new tab.
+ */
+export function planHerdrScoutPlacement(
+  snapshot: HerdrLayoutSnapshot | null,
+  options: HerdrPlacementOptions,
+): HerdrScoutPlacement {
+  const minPaneHeight = options.minPaneHeight ?? HERDR_DEFAULT_MIN_PANE_HEIGHT;
+  const minColumnWidth = options.minColumnWidth ?? HERDR_DEFAULT_MIN_COLUMN_WIDTH;
+  const splitParentRight = (reason: string): HerdrScoutPlacement => ({
+    mode: "stack",
+    splitPane: options.parentPaneId,
+    splitDirection: "right",
+    splitRatio: HERDR_PARENT_WIDTH_SHARE,
+    resizes: [],
+    reason,
+  });
+
+  const hasParent = !!snapshot?.panes.some((pane) => pane.paneId === options.parentPaneId);
+  if (!snapshot || snapshot.zoomed || !hasParent) return splitParentRight("no-geometry");
+
+  const columns = layoutHerdrColumns(snapshot, options.parentPaneId);
+  if (columns.length === 0) return splitParentRight("first-column");
+
+  const target = columns[columns.length - 1];
+  const paneCount = target.panes.length;
+  const anchor = target.panes[paneCount - 1];
+  const afterSplitHeight = Math.floor(herdrColumnHeight(target) / (paneCount + 1));
+  if (afterSplitHeight >= minPaneHeight) {
+    return {
+      mode: "stack",
+      splitPane: anchor.paneId,
+      splitDirection: "down",
+      splitRatio: 0.5,
+      resizes: planHerdrColumnSteps(snapshot, target, paneCount + 1),
+      reason: "stack",
+    };
+  }
+
+  const columnCount = columns.length + 1;
+  const columnWidth = (snapshot.area.width * HERDR_PARENT_WIDTH_SHARE) / columnCount;
+  if (columnWidth < minColumnWidth) {
+    return {
+      mode: "new-tab",
+      splitPane: null,
+      splitDirection: "right",
+      splitRatio: HERDR_PARENT_WIDTH_SHARE,
+      resizes: [],
+      reason: "width-guard",
+    };
+  }
+
+  return {
+    // The new pane and its split only exist after the split command, so the
+    // executor recomputes the pass from a fresh snapshot (F1 order).
+    mode: "new-column",
+    splitPane: options.parentPaneId,
+    splitDirection: "right",
+    splitRatio: HERDR_PARENT_WIDTH_SHARE,
+    resizes: [],
+    reason: "new-column",
+  };
+}
+
+/**
+ * Execute a placement: split, then run the geometry pass (`herdr pane layout`
+ * -> pure steps -> `pane resize`), at most HERDR_LAYOUT_MAX_PASSES times.
+ *
+ * Returns the new pane id, or null when the caller must fall back (new tab or
+ * a refused/failed split). Geometry failures are swallowed: a resize can never
+ * break a spawn, and `server_not_running` always propagates.
+ */
+export function applyHerdrLayoutPlan(
+  plan: HerdrScoutPlacement,
+  options: { parentPaneId: string; cwd?: string; minPaneHeight?: number; minColumnWidth?: number },
+): string | null {
+  if (plan.mode === "new-tab" || !plan.splitPane) return null;
+
+  let paneId: string;
+  try {
+    paneId = extractHerdrPaneId(
+      herdrExec(
+        buildHerdrSplitArgs(plan.splitPane, plan.splitDirection, {
+          cwd: options.cwd,
+          ratio: plan.splitRatio,
+        }),
+      ),
+      "pane split",
+    );
+  } catch (error) {
+    if (isHerdrErrorCode(error, "server_not_running")) throw error;
+    return null;
+  }
+
+  const scope: HerdrGeometryScope = plan.mode === "new-column" ? "layout" : "column";
+  const geometryOptions: HerdrGeometryOptions = {
+    parentPaneId: options.parentPaneId,
+    scope,
+    minPaneHeight: options.minPaneHeight,
+    minColumnWidth: options.minColumnWidth,
+  };
+
+  for (let pass = 1; pass <= HERDR_LAYOUT_MAX_PASSES; pass += 1) {
+    const steps = planHerdrGeometrySteps(getHerdrPaneLayout(options.parentPaneId), geometryOptions);
+    if (steps.length === 0) break;
+    for (const step of steps) {
+      try {
+        herdrExec(buildHerdrResizeArgs(step.pane, step.direction, step.amount));
+      } catch {
+        // Cosmetic: a refused resize (tab too small, pane closed mid-pass)
+        // must never break the spawn.
+      }
+    }
+  }
+
+  return paneId;
+}
+
 // ── Surface creation ────────────────────────────────────────────────────────
 
 function renameHerdrPane(pane: string, name: string): void {
@@ -470,32 +996,77 @@ function renameHerdrPane(pane: string, name: string): void {
 }
 
 /**
- * Create the pane a subagent runs in: `pane split --no-focus` from the parent
- * pane, falling back to a fresh tab when the split is refused (for example no
- * room left in the tab). `--no-focus` keeps the user's focus on the parent,
- * which is what makes parallel spawns usable.
+ * Create the pane a subagent runs in, following the two-column layout policy:
+ * scout 1 splits the parent RIGHT 50/50, later scouts stack DOWN inside that
+ * column, and a resize pass keeps the column even and the parent at ~50%. A new
+ * column starts only when the current one can no longer hold a legible pane; a
+ * column too narrow to add another falls back to a fresh tab.
+ *
+ * Every step degrades: a refused split falls back to a plain parent split, then
+ * to `tab create`. `--no-focus` keeps the user's focus on the parent, which is
+ * what makes parallel spawns usable.
  */
 export function createHerdrSurface(name: string): string {
   const parent = getHerdrParentPaneId();
   const cwd = process.cwd();
-
-  let paneId: string;
-  try {
-    paneId = extractHerdrPaneId(
-      herdrExec(buildHerdrSplitArgs(parent ?? undefined, "right", { cwd })),
-      "pane split",
+  const placementOptions: HerdrPlacementOptions = {
+    parentPaneId: parent ?? "",
+    minPaneHeight: getHerdrMinPaneHeight(),
+    minColumnWidth: getHerdrMinColumnWidth(),
+  };
+  const attempt = (): {
+    paneId: string | null;
+    mode: HerdrScoutPlacementMode;
+    reason: string;
+    staleAnchor: boolean;
+  } => {
+    const plan = planHerdrScoutPlacement(
+      parent ? getHerdrPaneLayout(parent) : null,
+      placementOptions,
     );
-  } catch (error) {
-    if (isHerdrErrorCode(error, "server_not_running")) throw error;
+    return {
+      paneId: applyHerdrLayoutPlan(plan, { ...placementOptions, cwd }),
+      mode: plan.mode,
+      reason: plan.reason,
+      // Only a column-pane split can lose its anchor to a closing subagent.
+      staleAnchor: plan.mode === "stack" && plan.splitPane !== placementOptions.parentPaneId,
+    };
+  };
+
+  let result = attempt();
+  if (!result.paneId && result.staleAnchor) result = attempt();
+  let paneId = result.paneId;
+
+  if (!paneId && result.mode !== "new-tab") {
+    // The planner wanted a split and herdr refused it (no room, stale anchor):
+    // last resort before a new tab is a plain parent split.
+    try {
+      paneId = extractHerdrPaneId(
+        herdrExec(
+          buildHerdrSplitArgs(parent ?? undefined, "right", {
+            cwd,
+            ratio: HERDR_PARENT_WIDTH_SHARE,
+          }),
+        ),
+        "pane split",
+      );
+    } catch (error) {
+      if (isHerdrErrorCode(error, "server_not_running")) throw error;
+    }
+  }
+
+  if (!paneId) {
+    // Either the planner hit the width guard, or every split attempt failed.
     try {
       paneId = extractHerdrRootPaneId(
         herdrExec(buildHerdrTabCreateArgs(name, { cwd })),
         "tab create",
       );
     } catch (tabError) {
-      const first = error instanceof Error ? error.message : String(error);
-      const second = tabError instanceof Error ? tabError.message : String(tabError);
-      throw new Error(`Could not create a herdr pane for "${name}".\nsplit: ${first}\ntab create: ${second}`);
+      const message = tabError instanceof Error ? tabError.message : String(tabError);
+      throw new Error(
+        `Could not create a herdr pane for "${name}".\nplacement: ${result.mode} (${result.reason})\ntab create: ${message}`,
+      );
     }
   }
 
