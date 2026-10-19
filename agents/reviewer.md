@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Code review agent - reviews changes for quality, security, and correctness
-tools: read, bash
+tools: read, bash, web_search, fetch_content, get_search_content, source_check, web_enable
 model: anthropic/claude-opus-4-6
 thinking: medium
 spawning: false

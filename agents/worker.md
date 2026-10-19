@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Implements tasks from todos - writes code, runs tests, commits with polished messages
-tools: read, bash, write, edit
+tools: read, bash, write, edit, web_search, fetch_content, get_search_content, source_check, web_enable
 deny-tools: claude
 model: anthropic/claude-sonnet-4-6
 thinking: minimal

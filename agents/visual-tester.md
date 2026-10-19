@@ -1,7 +1,7 @@
 ---
 name: visual-tester
 description: Visual QA tester — navigates web UIs via Chrome CDP, spots visual issues, tests interactions, produces structured reports
-tools: bash, read, write
+tools: bash, read, write, web_search, fetch_content, get_search_content, source_check, web_enable
 model: anthropic/claude-sonnet-4-6
 skill: chrome-cdp
 spawning: false

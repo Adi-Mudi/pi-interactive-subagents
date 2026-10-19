@@ -1,7 +1,7 @@
 ---
 name: scout
 description: Fast codebase reconnaissance - maps existing code, conventions, and patterns for a task
-tools: read, bash
+tools: read, bash, web_search, fetch_content, get_search_content, source_check, web_enable
 deny-tools: claude
 model: anthropic/claude-haiku-4-5
 output: context.md

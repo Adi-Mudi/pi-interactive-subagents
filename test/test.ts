@@ -1119,6 +1119,15 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("buildSubagentToolAllowlist keeps the pi-web-access names and the web_enable loader", () => {
+    assert.equal(
+      testApi.buildSubagentToolAllowlist(
+        "read,bash,web_search,fetch_content,get_search_content,source_check,web_enable",
+      ),
+      "read,bash,web_search,fetch_content,get_search_content,source_check,web_enable,caller_ping,subagent_done",
+    );
+  });
+
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
